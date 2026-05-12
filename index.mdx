@@ -1,133 +1,57 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Alpha Leak: Real-time Solana trading intelligence"
+description: "Alpha Leak ingests every Pump.fun event in real time, scores signals with ONNX ML models, and executes atomic trades on the Solana bonding curve."
 ---
 
-## Setting up
+Alpha Leak is a production-grade, multi-phase trading intelligence system built for Pump.fun on Solana. It processes every trade, token creation, and graduation event in real time, runs them through layered analysis — wallet scoring, adversarial detection, ML inference, and market regime classification — and executes trades atomically when high-conviction signals emerge.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="circle-info" href="/introduction">
+    Understand what Alpha Leak does and how its 30+ concurrent services work together.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Full pipeline diagram mapping every service from on-chain ingestion to live execution.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Connect to the live SSE feed and query historical data in under five minutes.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/overview">
+    REST endpoints and SSE stream reference with full request and response schemas.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How the system works
 
-Everything you need to create world-class documentation.
+Alpha Leak runs as a single process with 30+ background services coordinated through a database and cache layer. Events flow through four named phases, each building on the data produced by the previous one.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Ingest on-chain events">
+    The `EventProcessor` receives every trade, token creation, and graduation event the moment it lands on-chain — no polling, no batching. Events are decoded and fanned out simultaneously to all relevant services.
+  </Step>
+  <Step title="Score wallets and build intelligence">
+    Phase 1 computes a 7-component alpha score for every wallet. Phase 2 classifies token lifecycle state, detects coordinated bundles, scores creator risk, and builds a wallet co-occurrence graph.
+  </Step>
+  <Step title="Run ML inference">
+    Phase 3 scores signals every 5 seconds using ONNX LightGBM models with Platt-calibrated probabilities. Adversarial detection, copy-trade classification, and market regime run concurrently.
+  </Step>
+  <Step title="Execute trades atomically">
+    The live trader subscribes to the signal channel, selects a strategy based on phase and ML score, and executes buys and sells on the Pump.fun bonding curve as atomic transaction bundles.
+  </Step>
+</Steps>
 
-## Make your content agent ready
+## Explore by topic
 
-Make your docs work for humans and AI agents alike.
-
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
+<CardGroup cols={2}>
+  <Card title="The Pipeline" icon="pipe-section" href="/pipeline/ingestion">
+    Deep dives into ingestion, Phase 1 scoring, Phase 2 intelligence, and Phase 3 ML and advanced detection.
   </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
+  <Card title="Intelligence" icon="brain" href="/intelligence/wallet-intelligence">
+    Wallet scoring, adversarial detection, Genesis Watcher, and market regime classification.
   </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
+  <Card title="ML System" icon="microchip" href="/ml/models">
+    ONNX model deployment, 68-feature vector design, and model training workflows.
   </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
+  <Card title="Live Trader" icon="bolt" href="/live-trader/overview">
+    Phase-gated strategies, position sizing, circuit breakers, and real-time monitoring.
   </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+</CardGroup>

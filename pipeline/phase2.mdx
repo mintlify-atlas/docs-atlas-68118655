@@ -1,0 +1,135 @@
+---
+title: "Phase 2: Token Intelligence and Relationship Analysis"
+description: "Bundle detection, token lifecycle classification, creator risk scoring, wallet co-occurrence tracking, and graph-based cluster analysis."
+---
+
+Phase 2 transforms raw trade and signal data into structured intelligence about tokens, creators, and the relationships between wallets. While Phase 1 asks *how good is this wallet*, Phase 2 asks *what is happening around this token right now* — and *is that activity organic*. The outputs of Phase 2 flow into both the ML feature vector and the anti-signal system in Phase 3, providing the context needed to distinguish genuine momentum from coordinated manipulation.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="TokenLifecycle" icon="activity">
+    Classifies every active token into one of 8 lifecycle states every 60 seconds using real-time velocity and age data.
+  </Card>
+  <Card title="BundleDetector" icon="layers">
+    Identifies groups of wallets buying in coordinated 5-second windows, a key indicator of sniping or pump-and-dump operations.
+  </Card>
+  <Card title="CreatorRiskScorer" icon="shield-alert">
+    Builds a 0–100 risk profile for every token creator, measuring rug rate, insider presence, bot buyer share, and serial launch velocity.
+  </Card>
+  <Card title="CoOccurrence & GraphBuilder" icon="git-branch">
+    Tracks which wallets buy the same tokens together and runs hourly graph analysis to identify high-quality wallet clusters.
+  </Card>
+</CardGroup>
+
+## TokenLifecycle
+
+The `TokenLifecycle` classifier assigns every active, non-graduated token a lifecycle state, updated every 60 seconds. It uses real-time velocity data — buys and sells in the last 60 and 300 seconds — alongside token age to determine the current state.
+
+| State | Description |
+|---|---|
+| `launch` | Token is under 60 seconds old |
+| `early_accumulation` | Under 5 minutes old with rising buy pressure |
+| `momentum` | Sustained buy velocity with new unique buyers |
+| `euphoria` | High velocity, strong SOL inflow, aggressive price action |
+| `distribution` | Smart wallets selling into retail buying — a key exit signal |
+| `decline` | Falling velocity, sell pressure increasing |
+| `dead` | No trades for 5 or more minutes |
+| `graduated` | Token has crossed 85 SOL and moved to Raydium |
+
+The lifecycle state is encoded numerically (0–7) and included as a feature in the ML model, allowing the model to condition its predictions on where the token is in its life. A `distribution` state is a strong negative signal; `early_accumulation` on a high-alpha wallet buy is one of the strongest positive ones.
+
+<Warning>
+  A `distribution` state — smart wallets selling while retail continues buying — is treated as a major risk factor by the anti-signal system. If combined with other triggers, it can cause Phase 3 to emit an anti-signal and force-exit open positions.
+</Warning>
+
+## BundleDetector
+
+The `BundleDetector` identifies coordinated buy activity: groups of wallets entering a token together within the same 5-second time window, a pattern consistent with sniping bots or organised pump-and-dump operations.
+
+**Scan schedule:** every 10 minutes, covering the last 15 minutes of trades. On startup, a historical scan covers the last 24 hours in 2-hour chunks.
+
+**Detection logic:** trades are grouped into 5-second time buckets per token. Any bucket with 3 or more distinct wallets becomes a cluster candidate. Each candidate is then scored:
+
+| Signal | Confidence boost |
+|---|---|
+| Amount coefficient of variation < 0.3 (similar buy sizes) | +25% |
+| Buy rank span ≤ wallet count (consecutive entries) | +20% |
+| Cluster size ≥ 5 wallets | +15% |
+| Cluster size ≥ 10 wallets | +10% |
+
+Clusters scoring above the 30% base confidence threshold are written to `detected_bundles`. The detection method is recorded as one of `time_window`, `similar_amounts`, or `same_slot_coordinated`, depending on which signals are most prominent.
+
+<Note>
+  For every detected bundle, all wallet pairs in the cluster are written to `wallet_co_occurrence` with an incremented overlap count. This data feeds both the co-occurrence analysis and the `CopyTradeDetector` in Phase 3.
+</Note>
+
+## CreatorRiskScorer
+
+The `CreatorRiskScorer` builds a risk profile for every token creator with 2 or more tokens, updated every 30 minutes. The output is a 0–100 risk score that feeds directly into the ML feature vector and the `AntiSignalEmitter` in Phase 3.
+
+The scorer computes five underlying metrics:
+
+| Metric | Description |
+|---|---|
+| Rug rate | Share of tokens that died within 10 minutes of launch (last trade within 600s of creation, never graduated) |
+| Avg insider presence | Average insider wallet count across this creator's tokens |
+| Avg bot buyer pct | Average share of buyers classified as bots across all tokens |
+| Serial velocity | Rate of token creation — tokens per day over the last 30 days |
+| Risk score | Weighted composite of the above, 0–100 |
+
+A creator with 20 tokens, 80% of which died within minutes and 50% of whose buyers were bots, will score near 100. A creator with a long track record of graduated tokens with organic buyer bases will score near 0.
+
+## CoOccurrence
+
+The `CoOccurrence` service builds and maintains a wallet-pair co-occurrence matrix in the `wallet_co_occurrence` table. Every time two tracked wallets buy the same token within a short window, their pair's `buy_overlap_count` is incremented.
+
+Additional metrics tracked per wallet pair:
+
+| Field | Description |
+|---|---|
+| `avg_buy_delta_seconds` | Average time between wallet A's buy and wallet B's buy |
+| `buy_delta_stddev` | Consistency of the delay — low stddev suggests systematic copying |
+| `a_buys_first_ratio` | How often wallet A buys before wallet B — a directional indicator |
+
+These metrics are the raw material for the `CopyTradeDetector` in Phase 3, which uses them to identify leader-follower relationships between wallets.
+
+## GraphBuilder
+
+The `GraphBuilder` runs every hour and spawns a Python subprocess (`src/ml/graph_builder.py`) to perform graph-level analysis on the `wallet_co_occurrence` data. Standard graph algorithms identify wallet clusters — groups of wallets that co-buy frequently.
+
+For each identified cluster, it computes:
+
+| Feature | Description |
+|---|---|
+| `cluster_size` | Number of wallets in the cluster |
+| `cluster_avg_grad_rate` | Average graduation rate across wallets in the cluster |
+| `co_occurrence_max_score` | Highest co-occurrence score for the signal's wallet within its cluster |
+
+These cluster-level features are included in the ML feature vector, giving the model information about whether the wallet acting on a token is part of a known high-quality cluster or appears to be acting alone. A buy from a wallet embedded in a high-performing cluster is a stronger signal than the same wallet acting in isolation.
+
+## SignalScorer
+
+The `SignalScorer` computes a composite rule-based score for each signal. This score is stored as `rule_score` and serves as a fallback when ML inference is unavailable or disabled. It combines five inputs:
+
+<Steps>
+  <Step title="Wallet alpha score">
+    The 0–100 wallet score from Phase 1 at the time the signal was emitted. The single strongest component.
+  </Step>
+  <Step title="Token velocity">
+    Buys per minute at the time of the signal. Higher velocity amplifies the score.
+  </Step>
+  <Step title="Buy rank">
+    How early in the token's life the tracked wallet entered. Earlier rank = higher score.
+  </Step>
+  <Step title="Token lifecycle state">
+    The numeric lifecycle state from `TokenLifecycle`. `launch` and `early_accumulation` boost the score; `distribution` and `decline` suppress it.
+  </Step>
+  <Step title="Creator risk score">
+    A high creator risk score penalises the rule score regardless of wallet quality or velocity.
+  </Step>
+</Steps>
+
+<Tip>
+  The `rule_score` is itself included as a feature in the ML model. This allows the model to learn which rule-based patterns are actually predictive versus which ones the rules get wrong — the model can correct for the scorer's systematic biases.
+</Tip>

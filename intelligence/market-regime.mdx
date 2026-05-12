@@ -1,0 +1,76 @@
+---
+title: "Market Regime: Four-state on-chain classification"
+description: "How Alpha Leak classifies four market regimes every 10 minutes from on-chain signals to condition ML thresholds, genesis scoring, and execution."
+---
+
+Not all market conditions are equal. A token that would comfortably hit 2× in a bull market might barely move in a bear one. Running the same signal thresholds regardless of market context means over-trading in bad conditions and under-trading in good ones. The `MarketRegimeDetector` classifies the current market state every 10 minutes using observable on-chain signals and publishes the result to Redis, where it is consumed by the ML model, the genesis watcher, and the live trader.
+
+## The Four Regimes
+
+| Regime | Definition | Implication |
+|---|---|---|
+| `bull_euphoria` | Grad rate above 8% (2h window), above 100 tokens created/hr, above 500 SOL/hr | High confidence — loosen thresholds |
+| `bull_normal` | Grad rate above 3% (2h), above 30 tokens/hr | Standard thresholds apply |
+| `transition` | Creation or graduation rate diverges above 50% from 7-day average | Caution: conditions are shifting |
+| `bear` | Grad rate below 2% (24h), below 15 tokens/hr, below 50 SOL/hr | Tighten thresholds, reduce position size |
+
+## Detection Signals
+
+The classifier uses 11 observable inputs computed from on-chain data:
+
+<CardGroup cols={2}>
+  <Card title="Token Creation Rate" icon="plus">
+    Tokens created in the last 1 hour, 24 hours, and the 7-day rolling average. Creation rate divergence from the 7-day baseline is the primary trigger for `transition` classification.
+  </Card>
+  <Card title="Graduation Rates" icon="graduation-cap">
+    2-hour, 24-hour, and 7-day rolling graduation rates. The 2-hour rate is the primary signal for `bull_euphoria` and `bull_normal`; the 24-hour rate anchors the `bear` floor.
+  </Card>
+  <Card title="SOL Volume" icon="coins">
+    Total SOL volume in the last 1 hour and 24 hours. Volume thresholds gate the `bull_euphoria` classification — a high graduation rate with low volume is not a true euphoria state.
+  </Card>
+  <Card title="Live Trading Performance" icon="chart-line">
+    Recent signal hit rates from live trading: average peak multiple and 2× hit rate over the last 6 hours. This grounds the regime in actual trading outcomes, not just on-chain activity metrics.
+  </Card>
+</CardGroup>
+
+<Note>
+  The classification is rule-based, not ML-based. This is deliberate: regime classification needs to be fast, transparent, and robust in edge cases. An ML model would perform similarly on this problem but would be far harder to debug when it misclassifies.
+</Note>
+
+## Confidence Scoring
+
+Each regime classification includes a confidence value from 0 to 1. The confidence is not binary — it scales with how decisively the data crosses each regime boundary.
+
+<Accordion title="bull_euphoria confidence">
+  Confidence scales with how far above each threshold the metrics are. A graduation rate of 15% in a 2-hour window when the threshold is 8% produces a higher confidence than one at 8.5%.
+</Accordion>
+
+<Accordion title="bear confidence">
+  Confidence scales with how far below the thresholds the metrics fall. A graduation rate of 0.5% when the floor is 2% produces higher bear confidence than one at 1.8%.
+</Accordion>
+
+<Accordion title="bull_normal and transition confidence">
+  A fixed confidence of 0.6 is applied. These states are defined partly by exclusion — they represent conditions that are neither clearly bullish nor clearly bearish — making precise confidence scaling less meaningful.
+</Accordion>
+
+## Where Regime Is Used
+
+<Tabs>
+  <Tab title="ML Feature Vector">
+    The regime is encoded numerically (bear=0, transition=1, bull_normal=2, euphoria=3) and included in both the standard and genesis feature vectors. This allows the models to condition their predictions on market context — a 3× prediction in a bull market requires different evidence than in a bear market, and the model learns this distinction from training data.
+  </Tab>
+  <Tab title="Genesis Watcher">
+    The regime is included in the genesis feature vector under `market_regime_encoded`. Tokens launching during euphoria have a meaningfully different base rate of success than tokens launching during a bear — the genesis models use this context to calibrate their output.
+  </Tab>
+  <Tab title="Live Trader Thresholds">
+    The live trader reads the regime from Redis when evaluating whether to enter a position. In bear conditions, the ML probability threshold is raised to require higher conviction before capital is deployed. In euphoria, thresholds can be loosened to capture more of the elevated opportunity set.
+  </Tab>
+</Tabs>
+
+## Redis Caching and History
+
+The regime is cached at `market:regime` with a 10-minute TTL and includes the full feature snapshot at the time of detection. Any service can call `MarketRegimeDetector.getRegime()` to retrieve the current regime without a database query.
+
+<Info>
+  Every detection cycle also writes a snapshot to the `market_regime_snapshots` table for historical analysis and model training. This time-series of regime states is used to label training data with the market context at each historical signal, ensuring the models are not trained on regime-naive examples.
+</Info>

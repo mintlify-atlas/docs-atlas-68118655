@@ -1,0 +1,165 @@
+---
+title: "Monitoring: Pipeline Health and Trading Performance"
+description: "How to monitor Alpha Leak using /api/stats, live feed heartbeats, signal quality indicators, anti-signal rates, and the live_portfolio table."
+---
+
+All pipeline health and trading performance data is accessible through the REST API. This page covers the key endpoints and fields to watch, and explains what the values mean in operational context.
+
+## Pipeline stats
+
+The `/api/stats` endpoint returns a snapshot of the current pipeline state. Poll this endpoint to get a point-in-time view of every major subsystem:
+
+<CodeGroup>
+
+```javascript fetch stats
+const stats = await fetch('/api/stats').then(r => r.json());
+```
+
+```json example response
+{
+  "ws": {
+    "connected": true,
+    "eventsPerSec": 42,
+    "totalEvents": 4320000,
+    "currentSlot": 312450000
+  },
+  "signals": {
+    "total": 84200,
+    "last24h": 1240
+  },
+  "wallets": {
+    "tracked": 2840,
+    "scored": 1920,
+    "bots": 340
+  },
+  "regime": {
+    "state": "bull_normal",
+    "confidence": 0.6
+  },
+  "models": {
+    "loaded": 4,
+    "scored": 81200,
+    "fallbacks": 42
+  },
+  "uptime": 86400,
+  "memMb": 312
+}
+```
+
+</CodeGroup>
+
+**Key fields to watch:**
+
+| Field | Healthy | Warning |
+|---|---|---|
+| `ws.connected` | `true` | `false` — pipeline not receiving on-chain data |
+| `ws.eventsPerSec` | 20–200+ (market dependent) | Near 0 — possible disconnect |
+| `models.fallbacks` | 0 | Rising — ML inference degraded, signals using rule-based scoring |
+| `wallets.scored` | Growing over time | Stagnant — feature computation may have stalled |
+| `regime.state` | Any valid state | Relevant context for signal interpretation |
+
+## Live feed as a health signal
+
+The `/api/live/feed` SSE stream itself is a health indicator. A healthy pipeline emits a `heartbeat` event every 15 seconds. If the heartbeat stops while the connection remains open, the upstream pipeline has likely stalled at the WebSocket level.
+
+```javascript heartbeat check
+let lastHeartbeat = Date.now();
+
+es.addEventListener('heartbeat', () => {
+  lastHeartbeat = Date.now();
+});
+
+// Check for stalled feed
+setInterval(() => {
+  if (Date.now() - lastHeartbeat > 30_000) {
+    console.warn('Feed appears stalled — no heartbeat in 30s');
+  }
+}, 5000);
+```
+
+## Signal quality indicators
+
+When consuming signals, several payload fields indicate quality before any ML score is applied:
+
+| Field | Range | What it means |
+|---|---|---|
+| `walletStats.alphaScore` | 0–100 | Wallet's historical edge score. Above 75 has significantly higher hit rates than below 50. |
+| `tokenState.bundleConfidence` | 0–1 | Evidence of coordinated buying. Above 0.7 is a strong negative signal; below 0.15 looks organic. |
+| `tokenState.riskScore` | 0–100 | Composite token risk. Above 70 means multiple risk factors present simultaneously. |
+| `tokenState.lifecycleState` | enum | `momentum` and `early_accumulation` are most actionable; `distribution` warns that smart money may be exiting. |
+| `buysLast60s` / `buysLast300s` | count | Raw velocity. Rising velocity alongside a high alpha score is the canonical high-quality signal pattern. |
+
+## Market regime
+
+The current market regime is included in `/api/stats` under `regime.state`. The regime is reclassified every 10 minutes from on-chain data and is included as a feature in the ML models, so the model's probability outputs already account for current regime conditions.
+
+| State | Meaning |
+|---|---|
+| `bull_euphoria` | High graduation rates, strong volume, elevated token creation. Signals tend to have higher hit rates. |
+| `bull_normal` | Standard positive market conditions. |
+| `transition` | Market dynamics shifting — creation or graduation rate diverging from recent average. Elevated uncertainty. |
+| `bear` | Low graduation rates, thin volume. Signal quality tends to be lower across the board. |
+
+<Info>
+  The regime reclassification runs every 10 minutes. During fast market moves, there can be a brief window where conditions have shifted but the regime label has not yet updated.
+</Info>
+
+## Anti-signal rate
+
+Anti-signals appear on the `/api/live/feed` stream as `data.type === 'anti_signal'`. A healthy market produces a low but non-zero rate — some level of adversarial activity is always present on Pump.fun. A sudden spike usually indicates a coordinated campaign or a broader shift toward lower-quality tokens.
+
+Anti-signals include a `severity` field (count of triggers that fired, minimum 2) and a human-readable `reasons` array:
+
+```json anti_signal payload
+{
+  "type": "anti_signal",
+  "data": {
+    "tokenMint": "...",
+    "severity": 3,
+    "reasons": [
+      "Creator risk score 92/100 (87% rug rate across 34 tokens)",
+      "71% of buyers are bots",
+      "Coordinated bundle detected (89% confidence, 52% of buyers)"
+    ]
+  }
+}
+```
+
+## Graduation rate as a leading indicator
+
+Graduations appear on the live feed as `graduation` events. Tracking the graduation rate (graduations per hour relative to token creations per hour) gives an independent view of market quality that leads the official regime classification by a few minutes. A rising graduation rate that the regime hasn't yet reclassified is a useful early signal of improving conditions.
+
+```javascript graduation rate tracker
+let creates = 0;
+let grads = 0;
+
+es.addEventListener('signal', (e) => {
+  const d = JSON.parse(e.data);
+  if (d.type === 'signal' && d.data.action === 'create') creates++;
+});
+
+es.addEventListener('graduation', () => { grads++; });
+
+// Every minute
+setInterval(() => {
+  const rate = creates > 0 ? (grads / creates * 100).toFixed(1) : '—';
+  console.log(`Grad rate: ${rate}% (${grads}/${creates} last minute)`);
+  creates = 0; grads = 0;
+}, 60_000);
+```
+
+## live_portfolio table
+
+The `live_portfolio` table is the single source of truth for performance reporting. It is updated after every trade close.
+
+| Field | Description |
+|---|---|
+| `balance` | Current available SOL balance |
+| `total_pnl` | Cumulative P&L across all closed positions |
+| `win_count` | Total number of winning trades |
+| `loss_count` | Total number of losing trades |
+| `streak_data` | Current win/loss streak and peak streak values |
+
+<Note>
+  The portfolio table reflects closed-position P&L only. Unrealised P&L on open positions is visible through the open positions list, not through this table.
+</Note>

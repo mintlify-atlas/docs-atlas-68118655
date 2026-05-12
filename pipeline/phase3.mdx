@@ -1,0 +1,127 @@
+---
+title: "Phase 3: ML inference and advanced signal detection"
+description: "ONNX model inference, anti-signal emission, copy-trade detection, alpha decay, signal crowding, market regime, and model monitoring."
+---
+
+Phase 3 is where the system's analysis converges. Every data point produced by Phases 1 and 2 — wallet features, token lifecycle states, bundle detections, creator risk scores, co-occurrence graphs — is assembled into a feature vector and scored by a calibrated LightGBM model every 5 seconds. Alongside ML inference, a set of advanced detectors run on independent cadences to catch structural risks that statistical models cannot catch alone: copy-trade relationships, alpha decay, signal crowding, and market regime shifts. Together they determine whether a signal should be acted on, filtered, or reversed.
+
+## MlInference
+
+The `MlInference` service scores unscored signals every 5 seconds. It loads all `.onnx` model files from `src/ml/models/` at startup and hot-reloads every 5 minutes, so new models can be deployed without restarting the pipeline.
+
+### Prediction targets
+
+Each model targets a specific forward-looking outcome:
+
+| Target | Description |
+|---|---|
+| `reach_2x_1h` | Probability the token reaches 2× its current price within 1 hour |
+| `reach_3x_30m` | Probability the token reaches 3× within 30 minutes |
+| `reach_2x_10m` | Probability the token reaches 2× within 10 minutes |
+| `is_dead_soon` | Probability the token has no further upside |
+
+Each model is stored alongside a `_metadata.json` sidecar file containing the model ID, target name, ordered feature list, calibration parameters, and the PR-AUC achieved on the evaluation set.
+
+### Probability calibration
+
+Raw LightGBM output probabilities tend to be systematically under- or over-confident. Every model is calibrated using Platt scaling, applying a learned sigmoid transformation:
+
+```text
+calibrated_probability = σ(a · raw_score + b)
+```
+
+The parameters `a` and `b` are fitted on held-out data. The calibrated probability is what gets written to the database and compared against strategy thresholds — not the raw model output.
+
+### Composite scoring
+
+When multiple models are loaded simultaneously, the inference service computes a composite score per signal. Rather than averaging all models equally, the composite logic weights the model that best matches each signal's context — token age, lifecycle state, and which features are available — so the most relevant model always has the strongest voice.
+
+## AntiSignalEmitter
+
+The `AntiSignalEmitter` runs every 30 seconds and scans all tokens with buy signals in the last 15 minutes. For each token it checks six independent risk triggers:
+
+| Trigger | Threshold | Evidence recorded |
+|---|---|---|
+| Creator risk score | > 80 / 100 | Risk score, rug rate, token count |
+| Insider buyer percentage | > 40% of buyers | Insider count vs unique buyers |
+| Exit liquidity pattern | 2+ tracked wallets selling while retail buys | Tracked sell SOL vs retail buy SOL |
+| Wash trade percentage | > 30% of volume | Estimated wash trade ratio |
+| Bot buyer percentage | > 60% of buyers | Bot classification breakdown |
+| Bundle confidence | > 70% confidence and > 30% buyer share | Bundle method and buyer percentage |
+
+An anti-signal is emitted only when **2 or more** triggers fire simultaneously. This multi-trigger requirement substantially reduces false positives — a high creator risk score alone is insufficient; there must be corroborating evidence from a second independent source.
+
+<Warning>
+  Anti-signals are published to the same `trade:signals` Redis channel as buy signals, with type `anti_signal`. The live trader handles anti-signals by force-exiting any open position in the flagged token immediately.
+</Warning>
+
+## CopyTradeDetector
+
+The `CopyTradeDetector` runs every 15 minutes, analysing the `wallet_co_occurrence` table for pairs with consistent directional behaviour. A pair is flagged as a copy-trade candidate if all three conditions are met:
+
+- They share buy history on at least 5 tokens
+- One wallet buys first more than 75% of the time
+- The standard deviation of the delay between their buys is below 120 seconds
+
+Candidate pairs are classified into one of three types based on their timing signature:
+
+| Type | Avg delay | Delay stddev | Interpretation |
+|---|---|---|---|
+| `bot_copy` | < 5 seconds | < 3 seconds | Automated on-chain copying, likely MEV or bot-to-bot |
+| `alert_copy` | < 60 seconds | < 30 seconds | Alert-triggered execution via Telegram or Discord |
+| `manual_copy` | < 300 seconds | Any | Manual monitoring and copying |
+
+A confidence score (0–1) is assigned based on consistency, sample size, and directional ratio. Pairs below 0.3 confidence are discarded. This information prevents the system from treating a follower wallet's buy as an independent signal — a follower's entry is a much weaker indicator than the originator's.
+
+## AlphaDecayTracker
+
+The `AlphaDecayTracker` answers a question most signal systems ignore: *if you see this wallet buy a token, how long do you have before the edge disappears?*
+
+It runs hourly and computes a decay curve for every wallet with at least 15 signals in the last 30 days. For 8 delay buckets — 1s, 5s, 10s, 30s, 60s, 120s, 300s, and 600s — it calculates the average return you would achieve if you bought N seconds after this wallet's signal.
+
+From the decay curve it derives two values stored in `wallet_features`:
+
+| Derived value | Description |
+|---|---|
+| **Half-life** | The delay at which the expected return drops to 50% of the instantaneous return. A 30-second half-life means this wallet must be followed within seconds. |
+| **Optimal follow delay** | The delay bucket that maximises expected return, accounting for cases where waiting briefly improves entry price. |
+
+<Tip>
+  A wallet with a 10-minute half-life is far more actionable than one with a 5-second half-life, because the execution window is wide enough to fill at a good price. The live trader uses half-life data to set per-wallet response urgency thresholds.
+</Tip>
+
+## SignalCrowdingDetector
+
+The `SignalCrowdingDetector` runs every 60 seconds and detects tokens where tracked wallets collectively already hold a large share of the bonding curve's SOL. If the system's wallets own 30% of a bonding curve, there is limited remaining buying pressure available — exit liquidity is scarce.
+
+| Level | Tracked SOL / Curve SOL | Score multiplier |
+|---|---|---|
+| NONE | Below 5% | 1.0 — no penalty |
+| LOW | 5–15% | 0.9 |
+| MODERATE | 15–30% | 0.75 |
+| SEVERE | Above 30% | 0.5 |
+
+Results are cached in Redis at `crowding:<mint>` with a 2-minute TTL. The live trader checks this cache before entering any position and applies the score multiplier to the signal's composite score.
+
+## MarketRegimeDetector
+
+The `MarketRegimeDetector` classifies the overall Pump.fun market state every 10 minutes using four observable signals: token creation rate, graduation rate (measured over both 2h and 24h windows), SOL volume, and active wallet count. It also incorporates recent signal hit rates from the live trading history.
+
+Four regime states are recognised:
+
+| Regime | Conditions |
+|---|---|
+| `bull_euphoria` | Above 8% graduation rate (2h window), above 100 new tokens/hr, above 500 SOL volume/hr |
+| `bull_normal` | Above 3% graduation rate (2h window), above 30 new tokens/hr |
+| `bear` | Below 2% graduation rate (24h window), below 15 tokens/hr, below 50 SOL/hr |
+| `transition` | Token creation or graduation rate diverges above 50% from the 7-day average |
+
+The current regime is cached in Redis and included as a feature in both the standard and genesis ML models. The live trader and signal scorer can read it directly to tighten or relax entry thresholds based on market conditions.
+
+## ModelMonitor
+
+The `ModelMonitor` tracks the live performance of every loaded ML model against observed signal outcomes. It detects drift between the model's calibrated probabilities and actual observed hit rates — if a model predicts 70% win rate but only 40% of signals succeed, the gap is logged as a warning.
+
+<Note>
+  When the `ModelMonitor` detects significant drift, it logs a warning that the affected model should be retrained against more recent data. Because the `MlInference` service hot-reloads models every 5 minutes, a retrained model can be dropped into `src/ml/models/` and will be picked up without any pipeline restart.
+</Note>

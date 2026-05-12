@@ -1,0 +1,355 @@
+---
+title: "Alpha Leak REST API and SSE stream reference guide"
+description: "Reference for every Alpha Leak endpoint: live SSE feed, recent snapshot, paginated signals, wallet profiles, token state, and pipeline stats."
+---
+
+Alpha Leak exposes a live Server-Sent Events stream and six REST endpoints. The SSE feed is the primary interface — it delivers signals, graduations, and anti-signals in real time as they occur on-chain. The REST endpoints expose paginated historical data, wallet profiles, token state, and current pipeline statistics. All endpoints are served from a single hosted instance and require no API key beyond network access to that instance.
+
+---
+
+## Base URL
+
+```
+https://your-instance/api
+```
+
+Replace `your-instance` with the host you have been given. All paths below are relative to this base.
+
+---
+
+## Live feed — `GET /api/live/feed`
+
+The live feed is a **Server-Sent Events** stream. Connect with the browser-native `EventSource` API or any SSE client. The connection is long-lived — the server pushes events as they occur, so no polling is required.
+
+<Note>
+SSE clients reconnect automatically on connection loss. No manual reconnection logic is needed. A `heartbeat` event is emitted every 15 seconds to keep connections alive through proxies and load balancers.
+</Note>
+
+### Connecting
+
+```javascript connect.js
+const es = new EventSource('https://your-instance/api/live/feed');
+
+es.addEventListener('signal', (event) => {
+  const data = JSON.parse(event.data);
+
+  if (data.type === 'genesis_signal') {
+    // New token scored highly in its first 60 seconds
+    console.log('Genesis:', data.data.symbol, `score: ${data.data.genesisScore}`);
+
+  } else if (data.type === 'anti_signal') {
+    // Active token flagged — adversarial conditions detected
+    console.warn('Anti-signal:', data.data.tokenMint, data.data.reasons);
+
+  } else {
+    // Standard tracked-wallet signal
+    console.log('Signal:', data.data.tokenMint, data.data.action);
+  }
+});
+
+es.addEventListener('graduation', (event) => {
+  const token = JSON.parse(event.data);
+  console.log(`${token.symbol} graduated — ${token.volume} SOL total volume`);
+});
+
+es.onerror = () => {
+  // SSE clients reconnect automatically — no manual handling required
+};
+```
+
+### Event types
+
+<Tabs>
+  <Tab title="signal">
+    A tracked wallet — one the system has built a quality profile for — has made a significant buy. The payload includes the wallet's alpha score, ML probability score, token state, buy rank, velocity data, and creator risk.
+
+    The `data.type` field inside the event payload distinguishes a standard `signal` from a `genesis_signal` or `anti_signal`. Both `genesis_signal` and `anti_signal` are delivered on the `signal` SSE event name.
+
+    **Full signal payload with annotations:**
+
+    ```json signal payload
+    {
+      "type": "signal",
+      "data": {
+        "tokenMint": "So11...",         // Token being bought
+        "wallet": "ABC1...",            // Wallet that triggered the signal
+        "action": "buy",
+        "solAmount": 0.5,               // Size of this specific buy
+        "buyRank": 4,                   // This wallet was the 4th buyer on this token
+        "curvePct": 0.12,               // Bonding curve is 12% filled
+        "curveSol": 8.3,                // 8.3 SOL currently in the curve
+        "buysLast60s": 12,              // 12 buys on this token in the last 60 seconds
+        "buysLast300s": 34,             // 34 buys in the last 5 minutes
+        "walletStats": {
+          "alphaScore": 84,             // Wallet quality score (0–100)
+          "graduationRate": 0.41,       // 41% of tokens this wallet bought graduated
+          "winRate": 0.68,              // 68% of positions closed in profit
+          "captureEfficiency": 0.72     // Captures 72% of available peak return on average
+        },
+        "tokenState": {
+          "lifecycleState": "momentum", // Token lifecycle classification
+          "riskScore": 18,              // Token-level risk score (low = safer)
+          "bundleConfidence": 0.12,     // Low bundle confidence — looks organic
+          "creatorRiskScore": 24        // Creator has a solid track record
+        }
+      }
+    }
+    ```
+
+    <Note>
+      A high-quality signal has: high `alphaScore`, low `buyRank`, rising velocity, low `riskScore`, low `bundleConfidence`, and a `lifecycleState` of `momentum` or `early_accumulation`.
+    </Note>
+
+    **Payload field reference:**
+
+    <ResponseField name="type" type="string" required>
+      Always `"signal"` for this event type at the SSE envelope level.
+    </ResponseField>
+
+    <ResponseField name="data" type="object" required>
+      <Expandable title="data properties">
+        <ResponseField name="tokenMint" type="string" required>
+          The on-chain mint address of the token being bought.
+        </ResponseField>
+
+        <ResponseField name="wallet" type="string" required>
+          The wallet address that triggered this signal.
+        </ResponseField>
+
+        <ResponseField name="action" type="string" required>
+          Trade direction. Always `"buy"` for standard signals.
+        </ResponseField>
+
+        <ResponseField name="solAmount" type="number" required>
+          Size of this specific trade in SOL.
+        </ResponseField>
+
+        <ResponseField name="buyRank" type="number" required>
+          The ordinal position of this wallet among all buyers on this token. Lower is earlier — a `buyRank` of 1 means this was the wallet's first buy and it is the first tracked buyer on the token.
+        </ResponseField>
+
+        <ResponseField name="curvePct" type="number" required>
+          Fraction of the Pump.fun bonding curve that has been filled, expressed as a decimal (e.g. `0.12` = 12%).
+        </ResponseField>
+
+        <ResponseField name="curveSol" type="number" required>
+          Total SOL currently held in the bonding curve.
+        </ResponseField>
+
+        <ResponseField name="buysLast60s" type="number" required>
+          Number of buy transactions on this token in the last 60 seconds. A rising value indicates accelerating demand.
+        </ResponseField>
+
+        <ResponseField name="buysLast300s" type="number" required>
+          Number of buy transactions on this token in the last 5 minutes.
+        </ResponseField>
+
+        <ResponseField name="walletStats" type="object" required>
+          Quality profile for the wallet that triggered the signal.
+          <Expandable title="walletStats properties">
+            <ResponseField name="alphaScore" type="number" required>
+              Composite wallet quality score from 0 to 100. Derived from graduation rate, win rate, entry timing, hold behaviour, and return consistency. Higher is better.
+            </ResponseField>
+
+            <ResponseField name="graduationRate" type="number" required>
+              Fraction of tokens this wallet bought that subsequently graduated from the Pump.fun bonding curve to a DEX listing.
+            </ResponseField>
+
+            <ResponseField name="winRate" type="number" required>
+              Fraction of this wallet's closed positions that were profitable.
+            </ResponseField>
+
+            <ResponseField name="captureEfficiency" type="number" required>
+              Average fraction of the available peak return this wallet captures across all positions. A value of `0.72` means the wallet exits capturing 72% of the peak price move on average.
+            </ResponseField>
+          </Expandable>
+        </ResponseField>
+
+        <ResponseField name="tokenState" type="object" required>
+          Current classification and risk profile for the token.
+          <Expandable title="tokenState properties">
+            <ResponseField name="lifecycleState" type="string" required>
+              Token lifecycle classification. Common values: `early_accumulation`, `momentum`, `distribution`, `graduated`.
+            </ResponseField>
+
+            <ResponseField name="riskScore" type="number" required>
+              Token-level risk score from 0 to 100. Lower values indicate safer, more organic tokens. High scores suggest elevated adversarial risk.
+            </ResponseField>
+
+            <ResponseField name="bundleConfidence" type="number" required>
+              Probability (0–1) that coordinated bundle buying has been detected on this token. Values below 0.2 are considered low risk.
+            </ResponseField>
+
+            <ResponseField name="creatorRiskScore" type="number" required>
+              Risk score (0–100) for the token's creator wallet, derived from their historical behaviour across past tokens.
+            </ResponseField>
+          </Expandable>
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Tab>
+
+  <Tab title="genesis_signal">
+    A newly created token scored highly across the genesis model's 75-feature vector during its first 60 seconds of life. No tracked wallet is required — this classification is based purely on launch dynamics: early buyer behaviour, price action, bundle absence, and creator history.
+
+    Genesis signals are delivered on the `signal` SSE event, with `data.type` set to `"genesis_signal"`.
+
+    ```javascript genesis_signal example
+    es.addEventListener('signal', (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'genesis_signal') {
+        console.log('Genesis:', data.data.symbol, `score: ${data.data.genesisScore}`);
+      }
+    });
+    ```
+
+    <Note>
+      The genesis subsystem observes every newly created token for 60 seconds, accumulates early buyer behaviour and price dynamics in memory, then runs a separate family of genesis models to identify tokens likely to 3x, 5x, or 10x shortly after launch.
+    </Note>
+  </Tab>
+
+  <Tab title="anti_signal">
+    A token with recent buy signals has triggered two or more adversarial detection rules simultaneously — for example, coordinated bundle activity combined with a high bot-buyer percentage. Any system that opened a position based on the original signal should treat an `anti_signal` as an exit cue.
+
+    Anti-signals are delivered on the `signal` SSE event, with `data.type` set to `"anti_signal"`. The payload includes the token mint and an array of reasons that triggered the anti-signal.
+
+    ```javascript anti_signal example
+    es.addEventListener('signal', (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'anti_signal') {
+        console.warn('Anti-signal:', data.data.tokenMint, data.data.reasons);
+        // Exit any open position on data.data.tokenMint immediately
+      }
+    });
+    ```
+
+    <Warning>
+      The anti-signal response takes priority over all other exit logic. If you hold a position in a token that receives an anti-signal, exit immediately regardless of current price.
+    </Warning>
+  </Tab>
+
+  <Tab title="graduation">
+    A token has graduated from the Pump.fun bonding curve to a DEX listing. The payload includes the token symbol and total bonding curve volume in SOL.
+
+    Graduation events are delivered on the `graduation` SSE event name — separate from the `signal` event.
+
+    ```javascript graduation example
+    es.addEventListener('graduation', (event) => {
+      const token = JSON.parse(event.data);
+      console.log(`${token.symbol} graduated — ${token.volume} SOL total volume`);
+    });
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Recent data — `GET /api/live/recent`
+
+Returns a snapshot of the most recent signals, graduations, and large trades. Designed to be called once on page load to populate initial state before the SSE stream takes over.
+
+```javascript recent data
+const res = await fetch('https://your-instance/api/live/recent?limit=20');
+const { signals, graduations, largeTrades } = await res.json();
+
+// signals      — recent buy/sell signals with ML scores
+// graduations  — recently graduated tokens
+// largeTrades  — recent trades >= 1.0 SOL
+```
+
+### Query parameters
+
+<ParamField query="limit" type="number" default="20">
+  Maximum number of items to return in each of the three arrays. Applies to `signals`, `graduations`, and `largeTrades` independently.
+</ParamField>
+
+### Response
+
+<ResponseField name="signals" type="object[]">
+  Recent buy/sell signals, each with ML scores and wallet quality data. Same shape as signal payloads from the live feed.
+</ResponseField>
+
+<ResponseField name="graduations" type="object[]">
+  Recently graduated tokens, ordered by graduation time descending.
+</ResponseField>
+
+<ResponseField name="largeTrades" type="object[]">
+  Recent trades with a SOL value of 1.0 or more, regardless of whether they triggered a tracked-wallet signal.
+</ResponseField>
+
+---
+
+## Signals — `GET /api/signals`
+
+Paginated access to historical signals with optional ML score filtering. Use this endpoint to query signal history, build backtests, or audit past activity.
+
+```javascript signals
+const signals = await fetch('/api/signals?min_ml_score=0.80&limit=50').then(r => r.json());
+```
+
+### Query parameters
+
+<ParamField query="min_ml_score" type="number" placeholder="0.0–1.0">
+  Filter to signals where the ML model's calibrated probability meets or exceeds this threshold. Values between `0.70` and `0.90` are typical for high-conviction filtering. Omit to return all signals regardless of score.
+</ParamField>
+
+<ParamField query="limit" type="number" default="50">
+  Maximum number of signals to return per page.
+</ParamField>
+
+---
+
+## Wallets — `GET /api/wallets`
+
+Returns tracked wallet profiles with quality scores and activity flags. The system continuously scores up to 5,000 wallets on a rolling 30-minute cycle — this endpoint exposes the current state of those profiles.
+
+```javascript wallets
+const wallets = await fetch('/api/wallets?min_alpha=70&active_only=true').then(r => r.json());
+```
+
+### Query parameters
+
+<ParamField query="min_alpha" type="number" placeholder="0–100">
+  Filter to wallets with an `alphaScore` at or above this value. A threshold of `70` returns high-quality wallets; `85` and above are elite performers. Omit to return all tracked wallets.
+</ParamField>
+
+<ParamField query="active_only" type="boolean" default="false">
+  When `true`, returns only wallets that have made a trade within the most recent scoring window. Filters out dormant wallets that are tracked but not currently active.
+</ParamField>
+
+---
+
+## Tokens — `GET /api/tokens`
+
+Returns token records with lifecycle classification, risk scores, and bonding curve state. Covers all tokens the pipeline has observed, including those still on the curve and those that have graduated.
+
+```javascript tokens
+const tokens = await fetch('/api/tokens?graduated=false').then(r => r.json());
+```
+
+### Query parameters
+
+<ParamField query="graduated" type="boolean">
+  When `true`, returns only tokens that have graduated to a DEX listing. When `false`, returns only tokens still on the Pump.fun bonding curve. Omit to return all tokens regardless of graduation status.
+</ParamField>
+
+---
+
+## Stats — `GET /api/stats`
+
+Returns current pipeline statistics and the active market regime classification. Useful for monitoring system health, understanding current market conditions, and confirming the pipeline is running at full capacity.
+
+```javascript stats
+const stats = await fetch('/api/stats').then(r => r.json());
+```
+
+The response includes:
+
+- **Pipeline stats** — active service counts, signals emitted, tokens tracked, wallets scored, and recent throughput across the 30+ concurrent background services.
+- **Market regime** — the current classification across four possible states, reclassified every 10 minutes based on aggregate on-chain activity. The live trader uses the market regime to adjust position sizing and strategy eligibility.
+
+<Note>
+  The market regime is one of four states and is updated every 10 minutes. Strategies in the live trader can be configured to enable or disable based on the current regime.
+</Note>

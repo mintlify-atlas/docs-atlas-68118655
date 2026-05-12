@@ -1,0 +1,127 @@
+---
+title: "Alpha Leak pipeline architecture: 30+ services, 4 phases"
+description: "A full map of the Alpha Leak pipeline — 30+ concurrent services across four phases, from raw on-chain events to live trade execution."
+---
+
+Alpha Leak runs as a single process hosting 30+ concurrent background services, coordinated through a database and cache layer. Events are handled inline as they arrive — there is no queue between ingestion and processing, which keeps latency minimal and the operational footprint simple.
+
+The system is divided into four named phases. Each phase builds on the data produced by the one before it.
+
+## Pipeline overview
+
+```text
+On-chain Events (real time)
+        │
+        ▼
+┌───────────────────┐
+│   EventProcessor  │  Decodes raw events into typed signals.
+│                   │  Fan-out: routes each event to relevant services.
+└────────┬──────────┘
+         │  trade | create | complete
+         │
+         ├──────────────────────────────────────────────────┐
+         │                                                  │
+         ▼                                                  ▼
+┌─────────────────────┐                        ┌─────────────────────┐
+│   CORE SERVICES     │                        │   GENESIS WATCHER   │
+│                     │                        │                     │
+│  CurveManager       │                        │  60s observation    │
+│  TradeWriter        │                        │  75-feature vector  │
+│  VelocityTracker    │                        │  ONNX inference     │
+│  CandleAggregator   │                        │  genesis_signal →   │
+│  WalletDiscovery    │                        │  signal channel     │
+│  WalletEnrichment   │                        └─────────────────────┘
+│  OutcomeTracker     │
+│  CreatorTracker     │
+│  BotDetector        │
+│  RiskScorer         │
+│  DataArchiver       │
+│  MaintenanceService │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────────┐
+│   PHASE 1 — SCORING     │
+│                         │
+│  PeakTracker            │  Tracks 1h/4h/24h price peaks per signal.
+│  PnlCalculator          │  Realised PnL, win rate, hold times.
+│  FeatureComputer        │  30-min feature roll-up per active wallet.
+│  WalletScorer           │  7-component alpha score (0–100).
+└─────────┬───────────────┘
+          │
+          ▼
+┌─────────────────────────┐
+│  PHASE 2 — INTELLIGENCE │
+│                         │
+│  SignalScorer           │  Composite signal quality score.
+│  TokenLifecycle         │  8-state lifecycle classifier (60s cadence).
+│  BundleDetector         │  5s time-bucket cluster detection.
+│  CreatorRiskScorer      │  Rug rate, insider pct, serial detection.
+│  CoOccurrence           │  Wallet pair co-buy frequency graph.
+│  GraphBuilder           │  Graph analysis (hourly).
+└─────────┬───────────────┘
+          │
+          ▼
+┌─────────────────────────────────────┐
+│  PHASE 3 — ML & ADVANCED INTEL      │
+│                                     │
+│  MlInference         (5s cadence)   │  68-feature ONNX scoring.
+│  AntiSignalEmitter   (30s cadence)  │  Multi-trigger adversarial detection.
+│  DeepDiveWorker                     │  Enriched wallet analysis.
+│  CopyTradeDetector   (15m cadence)  │  3-type copy-trade classification.
+│  OperatorDetector                   │  Coordinated operator identification.
+│  AlphaDecayTracker   (60m cadence)  │  Per-wallet signal decay curves.
+│  SignalCrowdingDetector (60s)       │  Crowding ratio → score penalty.
+│  MarketRegimeDetector (10m)         │  4-state regime classification.
+│  ModelMonitor                       │  Live model drift detection.
+└─────────┬───────────────────────────┘
+          │
+          │  signal channel (real time)
+          ▼
+┌─────────────────────────┐
+│     LIVE TRADER         │
+│                         │
+│  InlineScorer           │  ONNX inference inline (no DB round-trip).
+│  PortfolioManager       │  Phase-gated positions + circuit breakers.
+│  TradeExecutor          │  Bonding curve execution, atomic bundles.
+│  ExitMonitor            │  3s poll: TP / SL / timeout / anti-signal.
+└─────────────────────────┘
+```
+
+## The four pipeline phases
+
+<Steps>
+  <Step title="Phase 1 — Scoring">
+    Scoring runs on a continuous 30-minute cycle across all active wallets. `PeakTracker` records price peaks at 1h, 4h, and 24h horizons for every signal. `PnlCalculator` computes realised PnL, win rate, and hold time distributions. `FeatureComputer` rolls up a per-wallet feature set, and `WalletScorer` distils that into a 7-component alpha score between 0 and 100.
+  </Step>
+  <Step title="Phase 2 — Intelligence">
+    Intelligence services build structured knowledge on top of raw event data. `TokenLifecycle` classifies each active token across 8 lifecycle states every 60 seconds. `BundleDetector` clusters trades into 5-second time buckets and flags coordinated entries. `CreatorRiskScorer` tracks rug rate, insider percentage, and serial-rugger patterns. `CoOccurrence` and `GraphBuilder` maintain a wallet co-buy frequency graph, updated hourly.
+  </Step>
+  <Step title="Phase 3 — ML and advanced intelligence">
+    ML inference runs every 5 seconds, scoring all active tokens against a 68-feature ONNX model. `AntiSignalEmitter` scans every 30 seconds for tokens that have triggered two or more adversarial rules simultaneously. `CopyTradeDetector` runs every 15 minutes to classify wallet behaviour into three copy-trade types. `MarketRegimeDetector` reclassifies the global market state every 10 minutes across 4 regimes. `AlphaDecayTracker` maintains per-wallet decay curves across 8 delay buckets, updated hourly.
+  </Step>
+  <Step title="Live trader">
+    The live trader subscribes to the real-time signal channel and acts on signals from all three emitters — `SignalEmitter`, `AntiSignalEmitter`, and `GenesisWatcher`. `InlineScorer` runs ONNX inference without a database round-trip. `PortfolioManager` applies phase-gated position limits and circuit breakers. `TradeExecutor` submits atomic bundles to the Pump.fun bonding curve. `ExitMonitor` polls every 3 seconds and triggers exits on take-profit, stop-loss, timeout, or anti-signal.
+  </Step>
+</Steps>
+
+## Data stores
+
+| Store | Role |
+|---|---|
+| **Database** | Primary store for all trades, signals, wallet profiles, ML scores, detected bundles, copy-trade pairs, regime snapshots, and live trade history. Trades table is monthly-partitioned for query performance. |
+| **Cache layer** | Real-time pub/sub channel for signal fan-out to the live trader; key-value cache for wallet stats, crowding ratios, market regime, and bonding curve state. Also maintains the tracked wallet and known bot sets. |
+| **Long-term archive** | Raw trade data older than 60 days is automatically archived for storage efficiency. |
+| **ONNX model files** | Loaded at startup and hot-reloaded every 5 minutes. Stored alongside metadata files describing features, calibration parameters, and PR-AUC. |
+
+## Concurrency model
+
+Every background service follows the same pattern: a timed loop that checks a `running` flag before each cycle, skipping if the previous run hasn't finished. This prevents overlapping database queries under load without requiring a separate job queue. Memory usage is monitored and logged after every run.
+
+## Inter-service communication
+
+Services communicate in two ways:
+
+**Database reads** — most intelligence services read each other's output from the database. For example, `MlInference` reads `WalletScorer` alpha scores; `AntiSignalEmitter` reads `BundleDetector` results.
+
+**Signal channel** — the real-time bus for the live trader. `SignalEmitter`, `AntiSignalEmitter`, and `GenesisWatcher` all publish to it. The live trader subscribes to all three types. The API server streams the channel to connected clients via Server-Sent Events.

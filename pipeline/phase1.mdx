@@ -1,0 +1,139 @@
+---
+title: "Phase 1: Wallet scoring and alpha score computation"
+description: "How Alpha Leak builds ground-truth wallet profiles using PnL calculation, peak tracking, feature computation, and a seven-component alpha score."
+---
+
+Phase 1 establishes the ground truth about every wallet the system observes. It answers a single question: given everything this wallet has ever done on Pump.fun, how good are they? The answer is a 0–100 alpha score computed from seven independently-weighted components. This score is the most important single input to the ML models — a strong wallet buy on a new token is the foundation of every high-confidence signal.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="FeatureComputer" icon="calculator">
+    Runs every 30 minutes. Computes a comprehensive behavioural feature set for up to 5,000 recently active wallets and writes results to `wallet_features`.
+  </Card>
+  <Card title="WalletScorer" icon="star">
+    Runs every 30 minutes. Reads updated features and produces a 0–100 alpha score with a confidence value scaled by trade count.
+  </Card>
+  <Card title="PnlCalculator" icon="trending-up">
+    Pairs buy and sell events per wallet per token using FIFO matching to compute realised P&L, hold time, and win/loss status.
+  </Card>
+  <Card title="PeakTracker" icon="flag">
+    Retrospectively measures price peaks at 1h, 4h, and 24h after a signal, producing the ground-truth labels used for ML training.
+  </Card>
+</CardGroup>
+
+## FeatureComputer
+
+The `FeatureComputer` runs every 30 minutes and processes up to 5,000 wallets that have been active in the last 35 minutes, or that have never had features computed and have bought at least 3 tokens. Features are computed with point-in-time correctness — they reflect only what was known at the time of observation, not retroactively adjusted data.
+
+<AccordionGroup>
+  <Accordion title="Entry behaviour">
+    How quickly and how early a wallet enters relative to a token's launch:
+
+    | Feature | Description |
+    |---|---|
+    | `avg_seconds_after_creation` | Average time between token launch and this wallet's buy |
+    | `pct_buys_under_60s` | Share of buys placed within 60 seconds of token launch |
+    | `pct_buys_under_300s` | Share of buys placed within 5 minutes of token launch |
+    | `pct_top10_entries` | How often this wallet is among the first 10 buyers |
+  </Accordion>
+  <Accordion title="Position sizing">
+    The distribution of how much SOL this wallet deploys per trade:
+
+    | Feature | Description |
+    |---|---|
+    | `avg_sol_per_buy` | Mean buy size in SOL |
+    | `median_sol_per_buy` | Median buy size (robust to outliers) |
+    | `sol_size_stddev` | Standard deviation of buy size |
+    | `max_single_buy` | Largest single buy ever recorded |
+  </Accordion>
+  <Accordion title="Hold behaviour">
+    How long wallets hold positions, and whether they flip or hold:
+
+    | Feature | Description |
+    |---|---|
+    | `avg_hold_time_seconds` | Average time between buy and sell across all positions |
+    | `pct_quick_flips` | Share of positions exited within 5 minutes |
+    | `pct_diamond_hands` | Share of positions held longer than 24 hours |
+  </Accordion>
+  <Accordion title="Creator diversity">
+    Which creators a wallet trades, and how concentrated their activity is:
+
+    | Feature | Description |
+    |---|---|
+    | `unique_creators_traded` | Number of distinct creators this wallet has bought from |
+    | `pct_repeat_creator_buys` | Share of buys on tokens from creators they've traded before — can indicate insider relationships |
+  </Accordion>
+  <Accordion title="Activity and returns">
+    Recent activity frequency and realised performance metrics:
+
+    | Feature | Description |
+    |---|---|
+    | `active_days_30d` | Number of distinct days active in the last 30 days |
+    | `tokens_traded` | Total unique tokens bought |
+    | `graduation_rate` | Share of tokens bought that eventually graduated |
+    | `win_rate` | Share of positions closed in profit |
+    | `sol_weighted_return` | Return weighted by SOL deployed |
+    | `avg_realized_multiple` | Average realised return multiple |
+    | `avg_peak_multiple` | Average peak available return multiple |
+    | `capture_efficiency` | Ratio of realised return to peak available return |
+    | `profit_factor` | Gross profit divided by gross loss |
+    | `return_stddev` | Standard deviation of per-position returns |
+  </Accordion>
+</AccordionGroup>
+
+## WalletScorer
+
+The `WalletScorer` runs every 30 minutes on wallets whose features have been updated since their last scoring. It requires at least 10 traded tokens to produce a valid score. The resulting **alpha score** runs from 0 to 100 and is computed from seven independently-weighted components:
+
+| Component | Weight | Description |
+|---|---|---|
+| Graduation rate | 20% | Share of tokens bought that eventually graduated to Raydium. Normalised against a 50% ceiling. |
+| Win rate | 20% | Share of positions closed in profit. |
+| Capture efficiency | 15% | How much of the available peak return the wallet actually captured. A wallet that always sells near the top scores highly. |
+| Return consistency | 15% | Inverse of return standard deviation. High variance hurts the score. |
+| Buy rank | 10% | How early the wallet typically enters relative to other buyers. Earlier entry = higher score. |
+| Recency | 10% | Exponential decay: wallets inactive for 14+ days lose score progressively. |
+| Discovery | 10% | Average peak multiple of tokens bought. Rewards wallets that find tokens before the crowd. |
+
+<Warning>
+  Wallets classified as bots are capped at a maximum alpha score of 30, regardless of their performance metrics. A bot that wins frequently is not a useful signal source.
+</Warning>
+
+The **confidence value** (0–1) scales with the number of tokens traded, reaching full confidence at 50 tokens. A high-scoring wallet with only 12 trades carries less weight than one with 80.
+
+## PeakTracker
+
+The `PeakTracker` retrospectively measures the highest price multiples reached by tokens after a signal was emitted. It runs continuously and updates each signal with observed outcomes:
+
+| Label | Description |
+|---|---|
+| `peak_multiple_1h` | Highest price multiple within 1 hour of the signal |
+| `peak_multiple_4h` | Highest price multiple within 4 hours |
+| `peak_multiple_24h` | Highest price multiple within 24 hours |
+| `reached_2x_1h` | Binary: did the token reach 2× within 1 hour? |
+| `reached_3x_30m` | Binary: did the token reach 3× within 30 minutes? |
+
+These are the ground-truth labels that the ML models in Phase 3 are trained against. Without accurate peak tracking, the model cannot learn which signals actually resulted in profitable outcomes.
+
+## PnlCalculator
+
+The `PnlCalculator` pairs buy and sell events per wallet per token to compute realised P&L. It uses FIFO matching — the oldest open buy is matched against each sell — and records:
+
+- Realised multiple per position
+- Hold time in seconds
+- Whether the position was a win or a loss
+
+These outputs feed directly into `FeatureComputer` (to populate return metrics) and into `WalletScorer` (to compute win rate, profit factor, and related components).
+
+## OutcomeTracker
+
+The `OutcomeTracker` closes the feedback loop for signal quality. Every signal is checked against actual on-chain outcomes at three checkpoints:
+
+```text
+1h  → updates peak_multiple_1h, reached_2x_1h
+4h  → updates peak_multiple_4h
+24h → updates peak_multiple_24h, final outcome classification
+```
+
+This data feeds `PeakTracker`, ML model training pipelines, and the `ModelMonitor` in Phase 3. It is the mechanism that connects real-world outcomes back to the features that predicted them.

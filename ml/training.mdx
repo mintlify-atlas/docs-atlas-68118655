@@ -1,0 +1,108 @@
+---
+title: "Model Training: Data pipeline, evaluation, and deployment"
+description: "How Alpha Leak trains LightGBM models on live signal history, evaluates with PR-AUC, calibrates with Platt scaling, and deploys via hot reload."
+---
+
+Alpha Leak's models are trained on the system's own historical signal data — the same signals, wallet features, and outcome labels that the live pipeline produces. This closed-loop design means the models improve continuously as more data accumulates, and it ensures that every feature the model sees in production was computed by the same code that produced it during training. There is no hand-labelled dataset, no external data vendor, and no synthetic augmentation.
+
+## Training data pipeline
+
+Training data is built by joining three sources:
+
+<CardGroup cols={3}>
+  <Card title="Signals" icon="bolt">
+    Every buy signal ever emitted, with the full feature snapshot at the time the signal fired. Point-in-time values prevent lookahead bias.
+  </Card>
+  <Card title="Outcomes" icon="flag-checkered">
+    `PeakTracker` measures the highest price multiple each token reached at 10m, 30m, 1h, 4h, and 24h after the signal. These become binary training labels.
+  </Card>
+  <Card title="Context" icon="database">
+    Wallet features, creator stats, co-occurrence graph scores, market regime snapshots, and token state at time of signal — the full 68-feature vector, assembled identically to live inference.
+  </Card>
+</CardGroup>
+
+The binary labels are derived directly from outcomes: `reach_2x_1h = 1` if the token actually reached 2× within an hour of the signal; `0` otherwise.
+
+## Train / validation split
+
+<Warning>
+The dataset is split **chronologically**, not randomly. The most recent 20% of signals are held out as the validation set. Random splitting would leak future wallet behaviour and token outcomes into the training set, producing models that appear to perform well in evaluation but fail in production.
+</Warning>
+
+Chronological splitting also means the validation set represents the model's most likely operating conditions — recent market dynamics — rather than an average over all historical conditions.
+
+## Algorithm and framework
+
+LightGBM gradient boosting is used for all models. Key reasons for this choice:
+
+<Tabs>
+  <Tab title="Missing value handling">
+    Many signals are missing some features — for example, a wallet with no prior history. LightGBM's native missing value handling outperforms imputation on tabular data with structural missingness, without requiring special preprocessing.
+  </Tab>
+  <Tab title="Feature importance">
+    LightGBM provides both gain-based and split-count importance rankings, which are used to audit the model and identify which features it actually relies on. This makes the model's behaviour interpretable.
+  </Tab>
+  <Tab title="ONNX export">
+    LightGBM models compile cleanly to ONNX, which is required for in-process inference inside the Node.js pipeline via `onnxruntime-node`.
+  </Tab>
+  <Tab title="Training speed">
+    Models train in minutes on a few hundred thousand signals, making the full retrain-evaluate-deploy loop fast enough to respond to market regime shifts.
+  </Tab>
+</Tabs>
+
+## Target imbalance and evaluation metric
+
+All targets are heavily imbalanced — relatively few tokens actually reach 3× in 30 minutes. LightGBM's `scale_pos_weight` parameter compensates for this during training.
+
+**PR-AUC (Precision-Recall Area Under Curve)** is the primary evaluation metric, not ROC-AUC. A model that predicts "no" for every signal would achieve 95%+ ROC-AUC but near-zero PR-AUC — PR-AUC is much more informative when the positive class is rare. Early stopping is applied against validation PR-AUC to prevent overfit without requiring manual epoch tuning.
+
+<Info>
+The PR-AUC achieved by each model is stored in its `_metadata.json` sidecar alongside the feature list and calibration parameters. This makes it possible to compare model versions at a glance without re-running evaluation.
+</Info>
+
+## Calibration
+
+Raw LightGBM outputs are probability-like but often miscalibrated — the model may output `0.80` for signals that actually hit the target only 55% of the time. Every model is calibrated post-training using **Platt scaling**: a sigmoid function `σ(a·x + b)` fitted on the held-out validation set.
+
+After calibration, a calibrated score of `0.85` means roughly 85% of signals at that score level actually hit the target. This is what makes the strategy threshold values meaningful rather than arbitrary.
+
+## Hyperparameter optimisation
+
+Key LightGBM parameters — `num_leaves`, `learning_rate`, `min_child_samples`, `feature_fraction`, `bagging_fraction`, and regularisation coefficients — are tuned using Optuna-based Bayesian search. The best parameters from each search run are recorded alongside the model and used as the starting point for future searches.
+
+## Training workflow
+
+The full retrain-evaluate-deploy cycle follows these steps:
+
+<Steps>
+  <Step title="Build the training dataset">
+    Query the signal history database, joining signals with their point-in-time feature snapshots and the outcome labels produced by `PeakTracker`. Apply the chronological train/validation split (most recent 20% held out).
+  </Step>
+  <Step title="Run hyperparameter search">
+    Execute Optuna Bayesian search over the key LightGBM parameters. The search optimises validation PR-AUC with early stopping active throughout.
+  </Step>
+  <Step title="Train with the best parameters">
+    Train the final model using the best parameter set found. `scale_pos_weight` is set automatically based on the class imbalance ratio in the training split.
+  </Step>
+  <Step title="Calibrate with Platt scaling">
+    Fit a sigmoid calibration function on the held-out validation set. Store the resulting `platt_a` and `platt_b` parameters in the model metadata.
+  </Step>
+  <Step title="Export to ONNX and validate">
+    Export the trained model to ONNX format. Run a sample of the training data through both the original LightGBM model and the ONNX export to confirm outputs match to within floating-point tolerance. Write the `_metadata.json` sidecar with the model ID, ordered feature list, calibration parameters, and PR-AUC.
+  </Step>
+  <Step title="Deploy via hot reload">
+    Copy the `.onnx` file and its `_metadata.json` sidecar into `src/ml/models/`. The `MlInference` service picks up the new model within 5 minutes and adds it to the active model set. No pipeline restart is required.
+  </Step>
+</Steps>
+
+## Retraining cadence
+
+There is no fixed retraining schedule. The `ModelMonitor` service tracks live model performance against observed signal outcomes and detects drift between calibrated probabilities and actual hit rates. When drift is detected — typically caused by a shift in market dynamics, Pump.fun platform changes, or wallet behaviour patterns — a new training run is initiated.
+
+In practice this means retraining every few weeks under normal conditions, or sooner when a significant platform event occurs such as fee structure changes or graduation threshold adjustments.
+
+## Genesis model training
+
+The genesis models follow the same methodology but use a separate 75-feature dataset assembled from the first-60-second observation windows stored by the `GenesisWatcher`. The targets are the same outcome labels applied to tokens rather than to specific wallet signals.
+
+See [Genesis Watcher](/intelligence/genesis-watcher) for the full genesis feature breakdown.

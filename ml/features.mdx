@@ -1,0 +1,174 @@
+---
+title: "ML Feature Vectors: Standard 68 and Genesis 75 Features"
+description: "Complete reference for every feature in the 68-feature standard and 75-feature genesis vectors — sources, semantics, categories, and defaults."
+---
+
+The standard model scores each buy signal against a 68-feature vector assembled at inference time from multiple live data sources. The genesis model uses a separate 75-feature vector built from a token's first-60-second observation window. Both vectors must be assembled in exact feature order — the `FEATURE_ORDER` constant in the codebase is the canonical source of truth, and the ordered `feature_names` array in each model's `_metadata.json` sidecar defines the order expected by that specific model.
+
+<Note>
+Feature order is not optional. A mismatch between the order in the metadata file and the order in which features are assembled at inference time will silently corrupt every prediction without raising an error.
+</Note>
+
+## Standard feature vector (68 features)
+
+The 68 features are grouped into nine categories below. Each category documents what the features measure and where they originate.
+
+<AccordionGroup>
+  <Accordion title="Wallet point-in-time (4 features)">
+    These are the wallet's stats *as they were when the signal fired*, not current values. This point-in-time snapshot is what prevents lookahead bias — the model cannot see information that was not available when the signal was emitted.
+
+    | Feature | Description |
+    |---|---|
+    | `alpha_score` | 0–100 composite quality score at time of signal |
+    | `wallet_graduation_rate` | Share of tokens bought that graduated, at signal time |
+    | `wallet_avg_buy_rank` | Typical buy rank at signal time (lower = earlier entry) |
+    | `wallet_trades_at` | Total trades observed at signal time |
+  </Accordion>
+
+  <Accordion title="Wallet behavioural (15 features)">
+    Computed from the wallet's full trading history by `FeatureComputer`. These features describe the wallet's characteristic patterns across all observed trades.
+
+    | Feature | Description |
+    |---|---|
+    | `tokens_traded` | Total unique tokens bought |
+    | `pct_top10_entries` | Fraction of buys that were in the first 10 wallets |
+    | `avg_seconds_after_creation` | Average delay between token creation and wallet's buy |
+    | `pct_buys_under_60s` | Fraction of buys within 60s of token creation |
+    | `pct_buys_under_300s` | Fraction of buys within 300s of token creation |
+    | `avg_sol_per_buy` | Mean buy size in SOL |
+    | `median_sol_per_buy` | Median buy size in SOL |
+    | `sol_size_stddev` | Stddev of buy sizes (high = inconsistent sizing) |
+    | `max_single_buy` | Largest single buy ever recorded |
+    | `avg_hold_time_seconds` | Average time between buy and sell |
+    | `pct_quick_flips` | Fraction of positions closed within 5 minutes |
+    | `pct_diamond_hands` | Fraction of positions held over 24 hours |
+    | `unique_creators_traded` | Number of distinct creators engaged with |
+    | `pct_repeat_creator_buys` | Fraction of buys on tokens from already-seen creators |
+    | `active_days_30d` | Distinct active days in the last 30 days |
+  </Accordion>
+
+  <Accordion title="Wallet returns (11 features)">
+    Computed from `PnlCalculator` and `PeakTracker` output. These features quantify how well the wallet has performed historically across realised and unrealised dimensions.
+
+    | Feature | Description |
+    |---|---|
+    | `graduation_rate` | Share of bought tokens that graduated |
+    | `win_rate` | Share of closed positions in profit |
+    | `sol_weighted_return` | SOL-weighted average return across all positions |
+    | `avg_realized_multiple` | Average exit multiple |
+    | `avg_peak_multiple` | Average of peak prices seen during hold |
+    | `capture_efficiency` | Ratio of realised multiple to peak multiple (0–1) |
+    | `profit_factor` | Total profit / total loss |
+    | `return_stddev` | Standard deviation of per-trade returns |
+    | `avg_loss_pct_on_losers` | Average loss magnitude on losing trades |
+    | `avg_gain_pct_on_winners` | Average gain magnitude on winning trades |
+    | `is_bot` | 1 if the wallet has been classified as a bot |
+  </Accordion>
+
+  <Accordion title="Wallet context (1 feature)">
+    | Feature | Description |
+    |---|---|
+    | `wallet_age_days` | Days since the wallet was first observed |
+  </Accordion>
+
+  <Accordion title="Signal-level (10 features)">
+    These describe the specific signal event — the wallet's behaviour on this particular token at this particular moment — not the wallet's historical aggregate.
+
+    | Feature | Description |
+    |---|---|
+    | `buy_rank` | This wallet's buy rank on this token |
+    | `sol_amount` | Size of this specific buy in SOL |
+    | `curve_pct_at_buy` | Bonding curve fill percentage at time of buy (0–1) |
+    | `curve_sol` | Curve SOL reserves at time of buy |
+    | `velocity_buys_60s` | Buys on this token in the last 60 seconds |
+    | `velocity_buys_300s` | Buys on this token in the last 300 seconds |
+    | `sol_volume_60s` | SOL volume on this token in the last 60 seconds |
+    | `buy_rank_percentile` | Buy rank divided by unique buyer count (0–1) |
+    | `sol_vs_wallet_avg` | This buy's SOL vs the wallet's average (1.0 = typical) |
+    | `token_age_at_signal` | Token age in seconds at time of signal |
+  </Accordion>
+
+  <Accordion title="Temporal (3 features)">
+    | Feature | Description |
+    |---|---|
+    | `buy_sell_ratio` | Total buys / (total sells + 1) at time of signal |
+    | `hour_of_day` | UTC hour of the signal (0–23) |
+    | `day_of_week` | Day of week (0=Sunday, 6=Saturday) |
+  </Accordion>
+
+  <Accordion title="Creator intelligence (8 features)">
+    Derived from the creator's historical record across all tokens they have launched. These features allow the model to discount signals from serial ruggers or heavy-bot deployers before the current token has any history.
+
+    | Feature | Description |
+    |---|---|
+    | `creator_graduation_rate` | This token's creator's historical graduation rate |
+    | `creator_rug_rate` | Quick-death rate across this creator's tokens |
+    | `creator_risk_score` | 0–100 composite creator risk score |
+    | `creator_tokens_created` | Total tokens created by this creator |
+    | `creator_serial_velocity` | Tokens per day over the last 30 days |
+    | `creator_avg_insider_pct` | Avg insider presence across creator's tokens |
+    | `creator_avg_bot_pct` | Avg bot buyer pct across creator's tokens |
+    | `creator_is_serial` | 1 if the creator has been classified as serial |
+  </Accordion>
+
+  <Accordion title="Token state (7 features)">
+    Snapshot of the token's current state at the moment the signal fires.
+
+    | Feature | Description |
+    |---|---|
+    | `token_unique_buyers` | Unique buyers on this token so far |
+    | `token_total_buys` | Total buy transactions |
+    | `token_total_sells` | Total sell transactions |
+    | `token_risk_score` | Token-level risk score (0–100) |
+    | `token_bot_buyer_pct` | Fraction of buyers classified as bots |
+    | `token_top10_concentration` | Share of token held by top 10 wallets |
+    | `token_bundle_confidence` | Highest bundle confidence score for this token |
+  </Accordion>
+
+  <Accordion title="Lifecycle (1 feature)">
+    | Feature | Description |
+    |---|---|
+    | `lifecycle_state_encoded` | Token lifecycle state encoded as integer (0=launch … 7=graduated) |
+  </Accordion>
+
+  <Accordion title="Social graph (5 features)">
+    Derived from the co-occurrence graph that links wallets frequently buying the same tokens together.
+
+    | Feature | Description |
+    |---|---|
+    | `cluster_size` | Number of wallets in this wallet's co-occurrence cluster |
+    | `co_occurrence_max_score` | Highest co-occurrence edge score for this wallet |
+    | `cluster_avg_grad_rate` | Average graduation rate of wallets in the same cluster |
+    | `tracked_wallets_already_in` | Count of tracked wallets already holding this token |
+    | `is_first_tracked_buy` | 1 if this is the first tracked wallet to buy |
+  </Accordion>
+
+  <Accordion title="Market context (2 features)">
+    Market-wide regime features that give the model awareness of whether the broader Pump.fun environment is hot or cold.
+
+    | Feature | Description |
+    |---|---|
+    | `tokens_created_last_hour` | Market-wide token creation rate |
+    | `rolling_graduation_rate_2h` | Market-wide graduation rate over the last 2 hours |
+  </Accordion>
+</AccordionGroup>
+
+## Genesis feature vector (75 features)
+
+The genesis models use a 75-feature dataset assembled from the first-60-second observation windows stored by the `GenesisWatcher`. The targets are the same outcome labels but applied to tokens rather than to specific wallet signals. See [Genesis Watcher](/intelligence/genesis-watcher) for the full feature breakdown.
+
+## Default values
+
+Every feature has a carefully chosen default value used when data is unavailable — for example, a wallet with no prior history. These defaults represent a neutral, unknown wallet in a neutral market, not a worst-case assumption.
+
+<Tip>
+Using worst-case defaults (e.g. setting `wallet_graduation_rate` to `0` for unknown wallets) would introduce systematic negative bias against new wallets and distort scores. The model was trained with neutral defaults applied for missing data, so it handles these correctly at inference time.
+</Tip>
+
+Representative defaults:
+
+| Feature | Default | Rationale |
+|---|---|---|
+| `wallet_avg_buy_rank` | `50` | Median rank — unknown wallet assumed mid-field |
+| `avg_sol_per_buy` | `0.5` | Typical small buyer |
+| `lifecycle_state_encoded` | `-1` | Unknown state |

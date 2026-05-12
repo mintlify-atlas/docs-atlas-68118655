@@ -1,0 +1,136 @@
+---
+title: "ML Model Architecture, Calibration, and Deployment"
+description: "Alpha Leak's LightGBM ONNX model families, Platt calibration, hot-reload deployment, composite scoring, and graceful fallback behaviour."
+---
+
+Alpha Leak's signal scoring is powered by LightGBM gradient boosting models compiled to ONNX format and executed in-process via `onnxruntime-node`. There is no separate inference server — models run directly inside the pipeline, which eliminates a network hop and keeps inference latency in the low milliseconds even at high signal throughput.
+
+## Model families
+
+Two families of models operate concurrently, each answering a different question about a token's potential.
+
+<CardGroup cols={2}>
+  <Card title="Standard models" icon="chart-line">
+    Score signals from tracked wallet buys. Given the wallet's history, token state, and current market, what is the probability the price reaches X× within Y minutes?
+  </Card>
+  <Card title="Genesis models" icon="rocket">
+    Score newly created tokens based on their first-60-second behaviour. Given the launch dynamics, what is the probability the token reaches X× within Y minutes?
+  </Card>
+</CardGroup>
+
+Both families use LightGBM multiclass or binary classification, compiled to ONNX and calibrated with Platt scaling.
+
+## Standard model targets
+
+Each model file addresses a specific price target and time window, and maps directly to a strategy configuration.
+
+| Model file | Target | Use case |
+|---|---|---|
+| `reach_2x_1h.onnx` | Probability of 2× in 1 hour | Primary strategy: `reach_2x_1h` |
+| `reach_3x_30m.onnx` | Probability of 3× in 30 minutes | Phase 2+ strategy: `reach_3x_30m` |
+| `reach_2x_10m.onnx` | Probability of 2× in 10 minutes | Phase 3 strategy: `reach_2x_10m` |
+| `is_dead_soon.onnx` | Probability of imminent death | Veto signal, combined with others |
+
+## ONNX deployment structure
+
+Each model is stored as a pair of files — the compiled weights and a metadata sidecar that carries everything the inference layer needs to reconstruct predictions correctly.
+
+```text
+src/ml/models/
+  reach_2x_1h.onnx              # Compiled model weights
+  reach_2x_1h_metadata.json     # Feature list, calibration params, PR-AUC
+```
+
+<Warning>
+The metadata file is essential. It contains the ordered feature list that the inference code uses to assemble the feature vector in the exact order the model was trained with. A mismatch in feature order would silently corrupt every prediction.
+</Warning>
+
+The metadata JSON for a standard model looks like this:
+
+```json
+{
+  "model_id": "reach_2x_1h_v3",
+  "model_type": "classification",
+  "target": "reach_2x_1h",
+  "version": 3,
+  "feature_names": ["alpha_score", "wallet_graduation_rate", ...],
+  "feature_count": 68,
+  "calibration": {
+    "method": "platt",
+    "platt_a": 1.42,
+    "platt_b": -0.31
+  },
+  "pr_auc": 0.34
+}
+```
+
+## Hot reloading
+
+Models are scanned every 5 minutes. If a new `.onnx` file appears in the models directory that is not already loaded, it is loaded and added to the active model set. ONNX sessions from old model versions are released to free memory. This allows new model versions to be deployed without restarting the pipeline.
+
+<Tip>
+To deploy a new model version, copy the `.onnx` file and its `_metadata.json` sidecar into `src/ml/models/`. The pipeline picks them up within 5 minutes — no restart required.
+</Tip>
+
+## Platt calibration
+
+LightGBM models output raw class probabilities that are often miscalibrated — the model may output `0.7` when the actual hit rate at that score level is only `0.5`. Every model is calibrated post-training using Platt scaling on a held-out calibration set.
+
+The transformation applied to every raw model output is:
+
+```text
+calibrated_prob = σ(platt_a × raw_prob + platt_b)
+                = 1 / (1 + exp(-(platt_a × raw_prob + platt_b)))
+```
+
+After calibration, a model output of `0.80` means approximately 80% of signals at that score level actually hit the target. This is what makes the threshold values in strategy configs meaningful rather than arbitrary.
+
+## Inference pipeline
+
+Every 5 seconds, `MlInference` fetches unscored signals from the database and runs them through all loaded models. For each signal, the following steps are executed in order:
+
+<Steps>
+  <Step title="Assemble the feature vector">
+    The 68-feature vector is assembled in the canonical order defined by the model's `feature_names` metadata field. Default values are substituted for any missing data.
+  </Step>
+  <Step title="Create the input tensor">
+    Each model's input tensor is created as a `Float32Array` of shape `[1, 68]`.
+  </Step>
+  <Step title="Run the ONNX session">
+    The ONNX session is executed. For classification models, the output is a `[1, 2]` probability tensor; the second element — `P(class=1)` — is extracted as the raw score.
+  </Step>
+  <Step title="Apply Platt calibration">
+    The raw probability is passed through the sigmoid calibration function using the `platt_a` and `platt_b` parameters from the model's metadata.
+  </Step>
+  <Step title="Write scores to the database">
+    The calibrated score is written back to the database alongside the signal record.
+  </Step>
+</Steps>
+
+## Composite scoring
+
+When multiple models are loaded, the inference service runs them all and stores their scores independently. The live trader reads the score for its specific strategy target.
+
+| Score field | Source model |
+|---|---|
+| `ml_score_1h` | Calibrated probability from `reach_2x_1h` |
+| `ml_score_30m` | Calibrated probability from `reach_3x_30m` |
+| `ml_score_10m` | Calibrated probability from `reach_2x_10m` |
+| `dead_prob` | Calibrated probability from `is_dead_soon` |
+
+A signal with `ml_score_1h = 0.85` and `dead_prob = 0.03` is a strong candidate for the `reach_2x_1h` strategy. The same signal with `dead_prob = 0.40` would be rejected regardless of `ml_score_1h`.
+
+## Fallback behaviour
+
+If `onnxruntime` is not installed or no models are present, the pipeline degrades gracefully rather than failing.
+
+<Note>
+When no ML models are available:
+
+- `MlInference` logs a warning and disables itself
+- Signals receive `ml_score = NULL`
+- The live trader falls back to `COALESCE(ml_score_1h, rule_score, 0)`, using the rule-based signal score as its decision metric
+- All other pipeline services continue operating normally
+
+This means the pipeline can run without ML models from day one, collecting data for future training while still trading on rule-based signals.
+</Note>

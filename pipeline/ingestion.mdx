@@ -1,0 +1,97 @@
+---
+title: "Real-time on-chain event ingestion and routing"
+description: "How Alpha Leak decodes every Pump.fun on-chain event, routes it to the correct pipeline services, and tracks velocity in real time."
+---
+
+The ingestion layer is the system's entry point to the chain. Every trade, token creation, and graduation event is decoded into a strongly-typed struct the moment it lands — nothing is polled, nothing is batched at the network level. The `EventProcessor` then fans each event out simultaneously to every downstream service that needs it, so no single service can delay another. This zero-wait dispatch model is what keeps signal latency low even when dozens of events arrive per second.
+
+## Event types
+
+Every piece of activity on Pump.fun produces one of three event types. The pipeline processes all three:
+
+| Event type | Trigger | Key fields |
+|---|---|---|
+| `trade` | Any buy or sell on a bonding curve | mint, wallet, solAmount, tokenAmount, isBuy, virtual reserves |
+| `create` | A new token is launched | mint, name, symbol, uri, bondingCurve, creator |
+| `complete` | A token graduates to Raydium | mint, bondingCurve |
+
+## Event routing
+
+The `EventProcessor` is the fan-out hub. Every decoded event is dispatched simultaneously to the services that need it — nothing waits for anything else.
+
+<Tabs>
+  <Tab title="On create">
+    When a `create` event arrives, three services are notified in parallel:
+
+    - **`CurveManager`** initialises the in-memory bonding curve state for the new token, ready to receive trade updates immediately.
+    - **`TradeWriter`** persists the token record to the database so it is available for historical queries.
+    - **`GenesisWatcher`** opens a 60-second observation window for the token, tracking its earliest buyer behaviour.
+  </Tab>
+  <Tab title="On trade">
+    Trade events are the highest-volume event type. Six services are notified simultaneously:
+
+    - **`CurveManager`** updates the live curve state with the new reserves.
+    - **`TradeWriter`** buffers the trade for high-throughput batch persistence.
+    - **`VelocityTracker`** updates rolling 60s and 300s buy counts and SOL volume.
+    - **`SignalEmitter`** evaluates whether the trading wallet is tracked and, if so, assembles a signal.
+    - **`CandleAggregator`** updates 1-minute OHLCV candles for charting and features.
+    - **`GenesisWatcher`** feeds the trade into any active observation window for that token.
+  </Tab>
+  <Tab title="On complete">
+    When a token graduates, three finalisation actions are triggered:
+
+    - **`CurveManager`** marks the token graduated and emits a `graduation` event downstream.
+    - **`WalletDiscovery`** scans the token's full buyer list to find new wallets worth tracking.
+    - The token is promoted to enhanced price tracking so post-graduation performance can be measured.
+  </Tab>
+</Tabs>
+
+## CurveManager
+
+The `CurveManager` maintains a live state object for every active token, updated with each incoming trade. This in-memory state is the source of truth for real-time price and market data — reading it never requires a database query.
+
+Each state object tracks:
+
+<CardGroup cols={2}>
+  <Card title="Reserve data" icon="chart-bar">
+    Real and virtual SOL and token reserves, updated on every trade. Used to compute the current price at any moment.
+  </Card>
+  <Card title="Activity counters" icon="activity">
+    Total buy and sell counts, unique buyer count, and cumulative SOL volume since launch.
+  </Card>
+  <Card title="Timeline" icon="clock">
+    First buyer wallet and timestamp. Graduation status and the timestamp at which graduation occurred.
+  </Card>
+  <Card title="Cache mirror" icon="database">
+    State is mirrored to the cache layer in real time so the live trader's exit monitor can read current prices for open positions without touching the database.
+  </Card>
+</CardGroup>
+
+<Note>
+  When a token crosses 85 SOL in reserves, `CurveManager` emits a graduation event. This triggers wallet discovery and promotion to enhanced price tracking automatically.
+</Note>
+
+## Trade batching
+
+Rather than writing each trade to the database individually, `TradeWriter` accumulates events in memory and flushes them in batches:
+
+```text
+Batch size:  200 trades
+Max latency: 1 second between flushes
+```
+
+This design keeps write throughput high during burst periods — when a viral token generates dozens of trades per second — without adding measurable latency from the signal pipeline's perspective. The signal path reads from the in-memory `CurveManager` state, not from the database, so batching has no effect on signal speed.
+
+## Velocity tracking
+
+`VelocityTracker` maintains rolling buy counts updated on every trade event. These values are attached to every signal payload and are key features in both the ML models and the rule-based scorer.
+
+| Metric | Window | Description |
+|---|---|---|
+| `buysLast60s` | 60 seconds | Number of distinct buys in the last 60 seconds |
+| `buysLast300s` | 300 seconds | Number of distinct buys in the last 5 minutes |
+| `solLast60s` | 60 seconds | SOL volume bought in the last 60 seconds |
+
+<Tip>
+  A spike in `buysLast60s` is typically the first observable indicator that a token is gaining momentum. The ML model uses velocity as one of its highest-weight features when predicting short-term price moves.
+</Tip>

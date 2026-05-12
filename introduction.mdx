@@ -1,0 +1,58 @@
+---
+title: "What is Alpha Leak: Solana trading intelligence"
+description: "Alpha Leak is a production-grade Solana trading intelligence system for Pump.fun — from raw on-chain events to live execution in one pipeline."
+---
+
+Alpha Leak is a production-grade, multi-phase trading intelligence system built for Pump.fun on Solana. It ingests every on-chain event in real time, runs them through layered analysis — wallet scoring, adversarial detection, ML inference, market regime classification — and executes trades atomically when high-conviction signals emerge.
+
+The system is not a simple copy-trading bot or a rule-based screener. It is a continuously learning intelligence pipeline that builds a persistent, ever-growing understanding of every wallet, token, and creator it observes, and uses that knowledge to make probabilistic bets on which tokens will hit specific price targets within specific time windows.
+
+## What it does
+
+<CardGroup cols={2}>
+  <Card title="Real-time ingestion" icon="bolt">
+    Processes every trade, token creation, and graduation event the moment it lands on-chain. No polling, no delays — the pipeline sees everything as it happens.
+  </Card>
+  <Card title="Wallet intelligence" icon="brain">
+    Builds a scored, feature-rich profile for every wallet it observes — graduation rate, win rate, entry timing, hold behaviour, return consistency — updated on a rolling 30-minute cycle across up to 5,000 wallets per pass.
+  </Card>
+  <Card title="Adversarial detection" icon="shield">
+    Detects bots, coordinated bundles, copy-traders, serial ruggers, wash traders, and exit-liquidity setups in real time. Adversarial signals feed directly into ML features and live position management.
+  </Card>
+  <Card title="ONNX ML inference" icon="microchip">
+    Runs LightGBM models compiled to ONNX for sub-millisecond inference. Models are calibrated with Platt scaling and scored every 5 seconds against a 68-feature vector. Both standard and genesis (first 60 seconds of a token's life) models run concurrently.
+  </Card>
+  <Card title="Genesis scoring" icon="seedling">
+    A dedicated subsystem observes every newly created token for 60 seconds, accumulates early buyer behaviour and price dynamics in memory, then runs a separate family of genesis models to identify tokens likely to 3x, 5x, or 10x shortly after launch.
+  </Card>
+  <Card title="Live execution" icon="rocket">
+    Executes buys and sells on the Pump.fun bonding curve using atomic transaction bundles. Position sizing, strategy selection, take-profit, stop-loss, and forced exits on anti-signals are all handled automatically, with full trade history persisted to the database.
+  </Card>
+</CardGroup>
+
+## System scale
+
+The numbers below give a sense of the operational depth of the system at steady state.
+
+| Dimension | Detail |
+|---|---|
+| Pipeline services | 30+ concurrent background services |
+| ML feature vector | 68 features (standard), 75 features (genesis) |
+| Wallet scoring cadence | Up to 5,000 wallets every 30 minutes |
+| Bundle detection window | 5-second clustering, 10-minute interval |
+| Anti-signal scan | Every 30 seconds, across all active tokens |
+| Signal crowding check | Every 60 seconds, cached in the cache layer |
+| Alpha decay profiling | 8 delay buckets per wallet, hourly |
+| Market regime | 4 states, reclassified every 10 minutes |
+| Copy-trade classification | 3 types (bot, alert, manual), 15-minute cycle |
+| Data archive | Automatic archive after 60 days |
+
+## How to navigate these docs
+
+Start with the [Architecture](/architecture) page if you want to understand what the system is capable of at a high level — it shows the full pipeline as a single diagram and maps every service to its phase.
+
+If you want to run the system, go to [Quickstart](/quickstart).
+
+If you want to understand a specific subsystem in depth — how wallet scoring works, how bundles are detected, how the ML models are built and served — each subsystem has its own dedicated page under **The Pipeline**, **Intelligence**, and **ML System**.
+
+If you want to run the live trader specifically — strategies, position sizing, circuit breakers, monitoring — see the **Live Trader** section.

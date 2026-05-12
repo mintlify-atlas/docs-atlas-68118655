@@ -1,81 +1,150 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "Quickstart: connect to the Alpha Leak signal feed"
+description: "Start receiving live Solana trading signals from Alpha Leak in under five minutes — SSE stream, REST endpoints, and signal interpretation."
 ---
 
-## Get started in three steps
+Alpha Leak exposes a live signal feed and a set of REST endpoints. This guide covers connecting to both, understanding the three signal types the system emits, and reading a full annotated signal payload.
 
-Get your documentation site running locally and make your first customization.
+## Base URL
 
-### Step 1: Set up your local environment
+All endpoints are available at your hosted instance URL. Replace `your-instance` throughout this guide with the host you've been given.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+```text
+https://your-instance/api
+```
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Connect to the live feed">
+    The primary interface is a **Server-Sent Events stream** that pushes signals, graduations, and anti-signals in real time as they occur on-chain. This is the fastest way to consume Alpha Leak data — no polling required.
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```javascript
+    const es = new EventSource('https://your-instance/api/live/feed');
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    es.addEventListener('signal', (event) => {
+      const data = JSON.parse(event.data);
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+      if (data.type === 'genesis_signal') {
+        // New token scored highly in its first 60 seconds
+        console.log('Genesis:', data.data.symbol, `score: ${data.data.genesisScore}`);
 
-### Step 3: Go live
+      } else if (data.type === 'anti_signal') {
+        // Active token flagged — adversarial conditions detected
+        console.warn('Anti-signal:', data.data.tokenMint, data.data.reasons);
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+      } else {
+        // Standard tracked-wallet signal
+        console.log('Signal:', data.data.tokenMint, data.data.action);
+      }
+    });
 
-## Next steps
+    es.addEventListener('graduation', (event) => {
+      const token = JSON.parse(event.data);
+      console.log(`${token.symbol} graduated — ${token.volume} SOL total volume`);
+    });
 
-Now that you have your docs running, explore these key features:
+    es.onerror = () => {
+      // SSE clients reconnect automatically — no manual handling required
+    };
+    ```
 
-<CardGroup cols={2}>
+    <Note>
+      The stream sends a `heartbeat` event every 15 seconds to keep connections alive through proxies and load balancers.
+    </Note>
+  </Step>
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+  <Step title="Fetch recent data on load">
+    Before the live stream has delivered events, use the `/api/live/recent` endpoint to populate your initial state.
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+    ```javascript
+    const res = await fetch('https://your-instance/api/live/recent?limit=20');
+    const { signals, graduations, largeTrades } = await res.json();
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+    // signals      — recent buy/sell signals with ML scores
+    // graduations  — recently graduated tokens
+    // largeTrades  — recent trades >= 1.0 SOL
+    ```
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+    This endpoint is designed to be called once on page load, with the SSE stream taking over from that point forward.
+  </Step>
 
-</CardGroup>
+  <Step title="Understand signal types">
+    Alpha Leak emits three types of signals on the live feed. Each carries a different meaning and warrants a different response.
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+    <Tabs>
+      <Tab title="signal">
+        A tracked wallet — one the system has built a quality profile for — has made a significant buy. The payload includes the wallet's alpha score, ML probability score, token state, buy rank, velocity data, and creator risk.
+
+        This is the primary signal type. A high-quality `signal` has a high `alphaScore`, a low `buyRank`, rising velocity, a low `riskScore`, low `bundleConfidence`, and a `lifecycleState` of `momentum` or `early_accumulation`.
+      </Tab>
+      <Tab title="genesis_signal">
+        A newly created token scored highly across the genesis model's 75-feature vector during its first 60 seconds of life. No tracked wallet is required — this is purely based on launch dynamics.
+
+        The Genesis Watcher observes every new token for 60 seconds, accumulates early buyer behaviour and price dynamics in memory, then runs a separate family of genesis models to identify tokens likely to 3x, 5x, or 10x shortly after launch.
+      </Tab>
+      <Tab title="anti_signal">
+        A token with recent buy signals has triggered 2 or more adversarial detection rules simultaneously — for example, a coordinated bundle combined with a high bot-buyer percentage. Any system acting on the original signal should treat this as an exit cue.
+
+        <Warning>
+          Anti-signals are time-sensitive. The live trader's `ExitMonitor` polls every 3 seconds specifically to catch these. If you are building on top of the feed, handle `anti_signal` events before processing new `signal` events.
+        </Warning>
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Query historical data">
+    All historical signal, wallet, and token data is available via REST.
+
+    ```javascript
+    // Signals with ML scores — paginated
+    const signals = await fetch('/api/signals?min_ml_score=0.80&limit=50').then(r => r.json());
+
+    // Tracked wallets with alpha scores
+    const wallets = await fetch('/api/wallets?min_alpha=70&active_only=true').then(r => r.json());
+
+    // Token data including lifecycle state and risk scores
+    const tokens = await fetch('/api/tokens?graduated=false').then(r => r.json());
+
+    // Current pipeline stats and market regime
+    const stats = await fetch('/api/stats').then(r => r.json());
+    ```
+
+    Full parameter reference for each endpoint is in the [API Reference](/api/overview).
+  </Step>
+
+  <Step title="Interpret a signal payload">
+    Here is a full buy signal payload with annotations:
+
+    ```json
+    {
+      "type": "signal",
+      "data": {
+        "tokenMint": "So11...",         // Token being bought
+        "wallet": "ABC1...",            // Wallet that triggered the signal
+        "action": "buy",
+        "solAmount": 0.5,               // Size of this specific buy
+        "buyRank": 4,                   // This wallet was the 4th buyer on this token
+        "curvePct": 0.12,               // Bonding curve is 12% filled
+        "curveSol": 8.3,                // 8.3 SOL currently in the curve
+        "buysLast60s": 12,              // 12 buys on this token in the last 60 seconds
+        "buysLast300s": 34,             // 34 buys in the last 5 minutes
+        "walletStats": {
+          "alphaScore": 84,             // Wallet quality score (0–100)
+          "graduationRate": 0.41,       // 41% of tokens this wallet bought graduated
+          "winRate": 0.68,              // 68% of positions closed in profit
+          "captureEfficiency": 0.72     // Captures 72% of available peak return on average
+        },
+        "tokenState": {
+          "lifecycleState": "momentum", // Token lifecycle classification
+          "riskScore": 18,              // Token-level risk score (low = safer)
+          "bundleConfidence": 0.12,     // Low bundle confidence — looks organic
+          "creatorRiskScore": 24        // Creator has a solid track record
+        }
+      }
+    }
+    ```
+
+    <Tip>
+      A high-quality signal has: high `alphaScore`, low `buyRank`, rising velocity, low `riskScore`, low `bundleConfidence`, and a `lifecycleState` of `momentum` or `early_accumulation`.
+    </Tip>
+  </Step>
+</Steps>

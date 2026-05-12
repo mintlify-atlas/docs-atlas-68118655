@@ -1,0 +1,101 @@
+---
+title: "Wallet Intelligence: Scoring and Tracking Smart Money"
+description: "How Alpha Leak discovers and scores wallets — covering the 7-component alpha score, bot detection patterns, and copy-trade graph analysis."
+---
+
+A raw buy event on Pump.fun is noise. That same event, attached to a wallet with a 40% graduation rate, a 0.8 capture efficiency, and a consistent history of top-10 entries, is something else entirely. The wallet intelligence system builds and maintains that context for every wallet the pipeline encounters — turning anonymous on-chain activity into a ranked, scored roster of smart money that continuously informs every trading decision.
+
+## Wallet Discovery
+
+Wallets enter the tracking system through one of three paths.
+
+<CardGroup cols={3}>
+  <Card title="Graduation-Based" icon="graduation-cap">
+    When a token crosses the 85 SOL graduation threshold, `WalletDiscovery` processes all buyers. Wallets that bought early and held are promoted to `is_active = true` status.
+  </Card>
+  <Card title="Signal-Based" icon="bolt">
+    Any wallet that triggers a signal — because it trades alongside an already-tracked wallet — is added to the `wallets` table for future enrichment.
+  </Card>
+  <Card title="Manual Seeding" icon="database">
+    Wallets can be added directly to the `tracked_wallets` Redis set for immediate attention, bypassing the organic discovery pipeline.
+  </Card>
+</CardGroup>
+
+## Wallet Enrichment
+
+The `WalletEnrichment` service continuously processes newly discovered wallets, fetching their historical Birdeye data (if available) to bootstrap their feature profiles without waiting for live trades. This means a wallet that was previously active before the pipeline started can arrive in the system with a complete historical record rather than beginning at zero.
+
+## The Alpha Score
+
+The alpha score (0–100) is a single number summarising a wallet's historical edge. It is designed to reward the behaviours that actually predict future token success — not raw volume or frequency, but quality of entry, ability to hold to meaningful returns, and consistency over time.
+
+```
+alpha_score =
+  graduation_score   × 0.20   +  // Share of bought tokens that graduated
+  win_score          × 0.20   +  // Share of positions closed in profit
+  capture_score      × 0.15   +  // Ratio of realised to peak return
+  consistency_score  × 0.15   +  // Inverse of return standard deviation
+  rank_score         × 0.10   +  // How early the wallet typically enters
+  recency_score      × 0.10   +  // Exponential decay for inactive wallets
+  discovery_score    × 0.10      // Average peak multiple of tokens bought
+```
+
+<CardGroup cols={2}>
+  <Card title="Confidence Scaling" icon="chart-line">
+    Confidence scales from 0 to 1 based on trade count, reaching full confidence at 50 tokens. A wallet with 10 trades and a score of 80 is treated meaningfully differently from one with 200 trades and the same score.
+  </Card>
+  <Card title="Bot Penalty" icon="robot">
+    Wallets classified as bots are hard-capped at a score of 30, regardless of their apparent metrics. Bots can accumulate impressive-looking stats through volume, but their behaviour carries no signal value.
+  </Card>
+</CardGroup>
+
+## Point-in-Time Correctness
+
+A subtle but important property of the alpha score: it is computed at the time of scoring, using only data available up to that point. When the ML model records `wallet_score_at_entry`, it captures the score as it was *when the signal fired*, not the wallet's current score.
+
+<Note>
+  This prevents lookahead bias in model training and ensures that historical backtests reflect what was actually knowable at the time of each trade decision.
+</Note>
+
+## Alpha Decay
+
+Not all smart money signals age equally. Some wallets move markets — when they buy, price moves within seconds. Others have a longer information half-life where their signal remains valid for minutes or more.
+
+The `AlphaDecayTracker` computes a per-wallet decay curve: the average return achievable if you had bought 1s, 5s, 10s, 30s, 60s, 120s, 300s, or 600s after the wallet's signal. From this curve, two values are derived:
+
+<CardGroup cols={2}>
+  <Card title="Alpha Half-Life" icon="hourglass-half">
+    The delay at which the expected return drops to 50% of the instant return. Wallets with sub-5-second half-lives are effectively unmatchable manually — useful only for bot execution.
+  </Card>
+  <Card title="Optimal Follow Delay" icon="clock">
+    The delay that maximises expected return. Buying instantly is not always optimal; wallets with half-lives above 60 seconds are significantly more actionable for human traders.
+  </Card>
+</CardGroup>
+
+## Bot Detection
+
+The `BotDetector` runs every 30 minutes and classifies wallets across three distinct behavioural patterns.
+
+<Accordion title="High-Frequency Bot">
+  Bought 20+ distinct tokens within a 2-hour window. This pattern is characteristic of broad sniping bots that buy every new token regardless of quality, with no selectivity or edge.
+</Accordion>
+
+<Accordion title="Micro-Buyer Bot">
+  Bought 10+ tokens in 6 hours with average position below 0.05 SOL and very low size variance (stddev &lt; 0.02 SOL). This pattern matches bots testing wallets or accumulating many tiny positions systematically.
+</Accordion>
+
+<Accordion title="Quick-Flipper Bot">
+  Executed buy-to-sell within 60 seconds on 3 or more tokens in 6 hours. This pattern is common among pump-and-dump participants and short-term snipers who are not providing meaningful signal.
+</Accordion>
+
+Detected bots are written to the `wallets` table with their `bot_type`, added to the `known_bots` Redis set, and capped at a maximum alpha score of 30. The `is_bot` field feeds directly into the ML model as a feature.
+
+## Copy-Trade Graph
+
+The copy-trade detection system maps the directional relationship between wallet pairs. When wallet A consistently buys a token 15 seconds before wallet B, across dozens of tokens, it is likely that B is following A through an alert system or automation.
+
+The system resolves which wallet is the originator and which is the follower. Signals from followers are treated with lower confidence than signals from originators — a follower's buy means someone already paid a higher price before the signal fired.
+
+<Tip>
+  The three copy-trade classifications — `bot_copy`, `alert_copy`, and `manual_copy` — represent meaningfully different latencies and therefore different implications for signal freshness. `bot_copy` followers are nearly useless as signal sources; `manual_copy` followers may still carry meaningful lag-adjusted value.
+</Tip>

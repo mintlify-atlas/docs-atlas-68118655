@@ -1,0 +1,94 @@
+---
+title: "Circuit Breakers: Hard Stops and Capital Protection"
+description: "The live trader's three circuit breakers: minimum balance halt, 30% daily drawdown limit, and 5-loss consecutive cooldown with reset mechanisms."
+---
+
+Circuit breakers are hard stops that halt trading when conditions indicate the system or market is in a state where continued trading is likely to destroy capital. They are not soft warnings — they unconditionally block new position opens, and some permanently halt the trader until a manual restart.
+
+## Active circuit breakers
+
+<AccordionGroup>
+  <Accordion title="Minimum balance halt">
+    ```text
+    if balance < 0.08 SOL → halt permanently
+    ```
+
+    If available balance drops below 0.08 SOL, the trader halts and sets `halted = true`. This state persists for the current session — no new positions are opened until the trader is manually restarted with a funded wallet.
+
+    The threshold is deliberately set above the cost of executing a sell, ensuring there is always enough SOL to exit any open position cleanly. This is a **permanent halt** within the session: it does not auto-recover.
+
+    **Reset:** restart the process with a funded wallet. The `halted` flag is in-memory only and clears on restart.
+  </Accordion>
+  <Accordion title="Daily drawdown halt">
+    ```text
+    equity = available_balance + total_open_position_sol
+    drawdown = (day_start_equity - equity) / day_start_equity
+
+    if drawdown ≥ 30% → halt for the day
+    ```
+
+    If the total portfolio value — available SOL plus deployed SOL in open positions — drops 30% from the day's starting value, trading halts until midnight UTC.
+
+    Importantly, the drawdown calculation uses **total equity**, not just available balance. Opening positions does not itself trigger drawdown: if you deploy 0.5 SOL into a position, that 0.5 SOL is still counted as equity. Drawdown only increases when deployed capital actually loses value.
+
+    **Reset:** automatic at midnight UTC via a daily reset timer.
+  </Accordion>
+  <Accordion title="Consecutive losses cooldown">
+    ```text
+    if consecutive_losses ≥ 5 → cooldown for 15 minutes
+    consecutive_losses resets to 0 after any winning trade
+    ```
+
+    Five consecutive losing trades triggers a 15-minute cooldown. This is a softer circuit breaker — trading resumes automatically after the cooldown expires. The consecutive loss counter resets after any winning trade, not just after the cooldown.
+
+    The rationale: five consecutive losses may indicate that signal quality has temporarily degraded due to a rapid market regime shift the detector hasn't yet classified, or that the models are encountering a distribution they weren't trained on. A brief pause is preferable to trading into worsening conditions.
+
+    **Reset:** automatic after 15 minutes. The `cooldownUntil` timestamp is in-memory only and clears on restart.
+  </Accordion>
+</AccordionGroup>
+
+## Summary of circuit breaker conditions
+
+| Circuit breaker | Trigger | Halt type | Reset |
+|---|---|---|---|
+| Minimum balance | Balance < 0.08 SOL | Permanent (session) | Manual restart |
+| Daily drawdown | Total equity down ≥ 30% from day start | Until midnight UTC | Automatic at 00:00 UTC |
+| Consecutive losses | 5 losses in a row | 15-minute cooldown | Automatic after 15 min |
+
+## Anti-signal force exits
+
+Anti-signals are not technically circuit breakers — they don't block new trades — but they function similarly in terms of protecting capital. When an `anti_signal` arrives for a token with an open position, the position is force-exited immediately regardless of current price, profit, or hold time.
+
+This can mean exiting a profitable position early if adversarial conditions are detected after entry. The cost of leaving some profit on the table is considered far smaller than the risk of holding through a coordinated dump.
+
+<Warning>
+  Anti-signal force exits override all other exit logic. There is no grace period and no price threshold — the position closes on the next available execution slot after the anti-signal is received.
+</Warning>
+
+## Interaction with position sizing
+
+The circuit breaker minimum balance (0.08 SOL) is factored directly into position sizing:
+
+```text
+size = min(size, balance - 0.08)
+```
+
+This means position sizing produces increasingly small positions as the balance approaches the minimum, rather than abruptly halting at the threshold. A trader at 0.12 SOL will size at most 0.04 SOL into a position.
+
+## State persistence
+
+The `halted` flag and `cooldownUntil` timestamp are **in-memory only** — they reset on process restart. This is intentional: a restart is a deliberate human action that implicitly acknowledges the halt condition and provides an opportunity to assess what caused it.
+
+| State | Storage | Reset mechanism |
+|---|---|---|
+| `halted` (min balance) | In-memory | Process restart |
+| Daily drawdown halt | In-memory | Midnight UTC timer |
+| `cooldownUntil` (consec. losses) | In-memory | 15-minute timer or restart |
+
+## Observing circuit breaker status
+
+The trader logs a warning with the reason every time a circuit breaker blocks a trade. The `/api/stats` endpoint reflects the current portfolio state, and the live feed will go quiet on new position opens when halted.
+
+<Tip>
+  Monitoring for an absence of new position open events alongside a non-zero open position count is the clearest external indicator that a halt or cooldown is active.
+</Tip>

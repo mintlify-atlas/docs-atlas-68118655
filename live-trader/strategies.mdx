@@ -1,0 +1,87 @@
+---
+title: "Trading Strategies: Phase Gating and Configuration"
+description: "Phase-gated standard and genesis strategies, position sizing formula, per-token cooldown, and signal source priority rules for the live trader."
+---
+
+Alpha Leak uses a phase-gated multi-strategy approach. Different strategies are unlocked as the portfolio balance grows, reflecting the different risk tolerances appropriate at each capital level. Lower phases prioritise capital preservation with conservative targets and tight hold windows; higher phases layer in higher-conviction, higher-multiple strategies.
+
+## Phase gating
+
+The trader's current phase is determined by available balance. Phase gating serves two purposes: it prevents over-leveraging at small balances where a single losing streak could wipe the account, and it naturally concentrates the trader's attention on the highest-quality signals when capital is limited.
+
+| Phase | Balance threshold | Max concurrent positions |
+|---|---|---|
+| 1 | 0.2 SOL+ | 1 |
+| 2 | 1.0 SOL+ | 2 |
+| 3 | 10.0 SOL+ | 5 |
+
+The trader branches into more strategies only once the base has been proven, not by configuration override.
+
+## Strategies
+
+<Tabs>
+  <Tab title="Standard strategies">
+    Standard strategies are triggered by wallet-based signals — tracked wallet buys on existing tokens.
+
+    | Strategy | Phase | ML threshold | Dead threshold | Take profit | Stop loss | Max hold |
+    |---|---|---|---|---|---|---|
+    | `reach_2x_1h` | 1+ | 80% | — | 2× | 0.4× | 60 min |
+    | `reach_3x_30m` | 2+ | 80% | — | 3× | 0.4× | 30 min |
+    | `reach_2x_10m` | 3+ | 80% | — | 2× | 0.5× | 10 min |
+
+    **`reach_2x_1h`** is the core strategy available from phase 1. It targets a 2× move within an hour with a 0.4× stop loss. The longer hold window allows time for a token to develop momentum even if the initial entry was slightly early.
+
+    **`reach_3x_30m`** is a phase 2 strategy targeting faster, larger moves. It unlocks once there is enough capital to run two concurrent positions — the tighter hold window means positions recycle faster.
+
+    **`reach_2x_10m`** is a scalping strategy that becomes available at phase 3. It requires the strongest signal quality (full ML confidence) and exits quickly regardless of outcome.
+  </Tab>
+  <Tab title="Genesis strategies">
+    Genesis strategies are triggered by `genesis_signal` events from the Genesis Watcher — signals generated from the first 60 seconds of a token's life, before any tracked wallet has necessarily bought it.
+
+    | Strategy | Phase | Score threshold | Dead threshold | Take profit | Stop loss | Max hold |
+    |---|---|---|---|---|---|---|
+    | `genesis_2x_5m` | 1+ | 90% | 30% | 2× | 0.55× | 5 min |
+    | `genesis_3x_30m` | 1+ | 90% | 50% | 3× | 0.40× | 30 min |
+    | `genesis_3x_1h` | 1+ | 90% | 50% | 3× | 0.40× | 60 min |
+    | `genesis_5x_2h` | 1+ | 80% | — | 5× | 0.35× | 2 hr |
+
+    Genesis strategies require higher score thresholds (90% vs 80%) to compensate for the inherently noisier signal — there is less history to work with when scoring a token that is only 60 seconds old. The dead probability veto is also stricter on fast strategies.
+
+    **`genesis_5x_2h`** is the most ambitious: targeting a 5× move within 2 hours with a 35% stop loss. It accepts a lower score threshold (80%) because the 2-hour hold window gives more time for the thesis to play out.
+  </Tab>
+</Tabs>
+
+## Position sizing
+
+Position size is calculated as a percentage of available balance, clamped between a minimum and maximum, and adjusted to preserve the circuit breaker's minimum balance reserve:
+
+```text
+size = balance × position_pct
+size = max(size, min_position)
+size = min(size, max_position)
+size = min(size, balance - min_balance_reserve)
+
+if size < min_position: skip trade
+```
+
+Default parameters: 10% of balance per trade, minimum 0.05 SOL, maximum 2.0 SOL. The minimum balance reserve ensures the circuit breaker's minimum balance check is never bypassed by sizing.
+
+At phase 1 with a 0.2 SOL balance, a typical position is 0.02 SOL. At phase 3 with 15 SOL, a typical position is 1.5 SOL.
+
+<Note>
+  If the computed size falls below `min_position` after the reserve is subtracted, the trade is skipped entirely rather than entering an undersized position.
+</Note>
+
+## Per-token cooldown
+
+After closing any position — win or loss — the token is placed in a 30-minute cooldown. The trader will not re-enter the same token within this window. This prevents re-entry on tokens that have already pumped and dumped, where the signal system might still be emitting buy signals from wallets who are now stuck holding.
+
+## Signal source priority
+
+When a signal arrives, the trader checks all eligible strategies in priority order:
+
+1. Genesis strategies take precedence if the signal type is `genesis_signal`
+2. Among multiple eligible strategies, the one with the highest `priority` value in the config is selected
+3. Only one position is opened per signal event — the first eligible strategy wins
+
+This prevents the trader from attempting to open multiple positions on the same token from the same signal event.

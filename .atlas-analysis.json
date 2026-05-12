@@ -1,0 +1,92 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Alpha Leak",
+  "projectDescription": "A production-grade, multi-phase Solana trading intelligence system that ingests real-time on-chain events, runs ML inference, and executes trades atomically on Pump.fun.",
+  "theme": "luma",
+  "primaryColor": "#6366f1",
+  "lightColor": "#818cf8",
+  "darkColor": "#4f46e5",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "architecture",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "The Pipeline",
+            "pages": [
+              "pipeline/ingestion",
+              "pipeline/phase1",
+              "pipeline/phase2",
+              "pipeline/phase3"
+            ]
+          },
+          {
+            "group": "Intelligence",
+            "pages": [
+              "intelligence/wallet-intelligence",
+              "intelligence/adversarial-detection",
+              "intelligence/genesis-watcher",
+              "intelligence/market-regime"
+            ]
+          },
+          {
+            "group": "ML System",
+            "pages": [
+              "ml/models",
+              "ml/features",
+              "ml/training"
+            ]
+          },
+          {
+            "group": "Live Trader",
+            "pages": [
+              "live-trader/overview",
+              "live-trader/strategies",
+              "live-trader/circuit-breakers",
+              "live-trader/monitoring"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API Reference",
+            "pages": [
+              "api/overview"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Real-time Solana on-chain event ingestion with zero polling latency",
+    "ONNX LightGBM ML inference with Platt-calibrated probability scoring",
+    "7-component wallet alpha scoring across up to 5,000 wallets per 30-minute cycle",
+    "Adversarial detection: bundle clustering, bot classification, copy-trade graph analysis",
+    "Genesis Watcher: 60-second token observation with a 75-feature genesis model family",
+    "4-state market regime classification updated every 10 minutes",
+    "Phase-gated live execution with atomic transaction bundles on the Pump.fun bonding curve",
+    "Server-Sent Events live feed for real-time signal, anti-signal, and graduation events"
+  ],
+  "publicApiSurface": [
+    "GET /api/live/feed (SSE stream: signal, genesis_signal, anti_signal, graduation, heartbeat)",
+    "GET /api/live/recent?limit= (signals, graduations, largeTrades)",
+    "GET /api/signals?min_ml_score=&limit=",
+    "GET /api/wallets?min_alpha=&active_only=",
+    "GET /api/tokens?graduated=",
+    "GET /api/stats",
+    "ONNX models: reach_2x_1h.onnx, reach_3x_30m.onnx, reach_2x_10m.onnx, is_dead_soon.onnx",
+    "Strategies: reach_2x_1h, reach_3x_30m, reach_2x_10m, genesis_2x_5m, genesis_3x_30m, genesis_3x_1h, genesis_5x_2h"
+  ]
+}

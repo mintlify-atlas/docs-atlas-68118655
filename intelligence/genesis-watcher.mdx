@@ -1,0 +1,133 @@
+---
+title: "Genesis Watcher: Scoring tokens in their first 60 seconds"
+description: "How Alpha Leak watches every new Pump.fun token's first 60 seconds, builds a 75-feature vector, and scores it against genesis ONNX models."
+---
+
+Standard ML signals fire when a tracked wallet buys — they are, by definition, reactive. The Genesis Watcher is different: it attempts to predict a token's outcome from its *launch dynamics*, before any tracked wallet has touched it. This is the hardest possible signal to get right, and the hardest to fake. A token's first minute is a chaotic mix of bots, insiders, random retail, and occasionally genuine organic interest. The genesis models are trained to distinguish the patterns that survive from the ones that die.
+
+## Observation Flow
+
+<Steps>
+  <Step title="Token creation detected">
+    When a `create` event arrives from the Pump.fun program, the Genesis Watcher immediately opens an observation window for that token. Every subsequent trade event for that token is accumulated in memory. The system handles up to 500 active tokens simultaneously before the oldest windows begin to be evicted.
+  </Step>
+  <Step title="30-second early check">
+    At 30 seconds, a preliminary assessment runs. If the token shows signs of being already dead — no buys, curve not moving — the observation is aborted immediately and no compute is wasted. If the token shows exceptionally high conviction already (score well above threshold), an early signal can be emitted before the full window elapses.
+  </Step>
+  <Step title="Buyer lookup (every 10 seconds)">
+    Throughout the active window, a batch DB lookup runs every 10 seconds to resolve which current buyers are in the wallet database. This populates the buyer quality features and is the most I/O-intensive part of the genesis pipeline. Results are cached at `wcache:<wallet>` with a 5-minute TTL to minimise redundant queries during burst periods.
+  </Step>
+  <Step title="Full feature vector assembled at 60 seconds">
+    At 60 seconds, the complete 75-feature vector is assembled and run through the genesis ONNX models. Each enabled strategy is evaluated in priority order.
+  </Step>
+  <Step title="Signal emitted (if threshold exceeded)">
+    If a strategy's score exceeds its threshold and the dead-probability veto does not apply, a `genesis_signal` is published to the `trade:signals` Redis channel for the live trader to consume. A token generates at most one genesis signal per observation window.
+  </Step>
+</Steps>
+
+## The 75-Feature Genesis Vector
+
+Genesis features describe *the token and its launch context*, not a specific wallet. This is what distinguishes genesis signals from standard wallet-triggered signals — the unit of analysis is the launch event itself.
+
+<Tabs>
+  <Tab title="Creator History (10)">
+    - Graduation rate, rug rate, and overall risk score
+    - Serial velocity (tokens launched per day over last 30 days)
+    - Average insider presence and average bot buyer percentage across prior tokens
+    - Days since last token launched
+    - Whether the creator has ever had a graduated token
+  </Tab>
+  <Tab title="Token Metadata (7)">
+    - Name length and symbol length
+    - Presence of numbers in the name, all-caps name flag
+    - Whether a metadata URI was provided
+    - Hour of day and day of week at creation time
+  </Tab>
+  <Tab title="Buyer Flow Dynamics (14)">
+    - Buy and sell counts at 30s and 60s
+    - Unique buyers at 30s and 60s
+    - SOL volume at 30s and 60s
+    - Average, median, max, and standard deviation of buy sizes
+    - Time to first buy, average time between buys, timing standard deviation
+    - Percentage of buys occurring within 2 seconds of each other
+  </Tab>
+  <Tab title="Price Action (10)">
+    - Curve SOL at 30s and 60s; curve percentage at 60s
+    - Price change percentage at 60s; max price multiple within 60s
+    - Price momentum from 30s to 60s
+    - Sell ratio at 60s; net SOL flow at 60s; time to first sell
+  </Tab>
+  <Tab title="Creator Behaviour (4)">
+    - Whether the creator bought their own token
+    - Creator buy SOL amount
+    - Whether the creator sold within 60s and how much
+  </Tab>
+  <Tab title="Advanced Derived (11)">
+    - Buy concentration (Herfindahl-Hirschman Index of buyer distribution)
+    - Organic timing score (how random vs mechanical the buy timing is)
+    - Buyer diversity (unique buyers / total buys)
+    - Momentum ratio (volume in last 30s vs first 30s)
+    - Buys per unique buyer (detects single-wallet spamming)
+    - Percentage of round-number buy sizes (0.1, 0.5, 1.0 SOL — bot signal)
+    - Curve SOL acceleration (rate of change of curve growth)
+    - Largest single buyer's share of total SOL
+    - Sell/buy size ratio
+  </Tab>
+  <Tab title="Buyer Quality (12)">
+    - Percentage of buyers found in the wallet database
+    - Percentage in the tracked wallet set
+    - Percentage classified as bots
+    - Percentage with fresh wallets (never seen before)
+    - Average and max buyer graduation rates
+    - Average buyer win rate, tokens traded, and wallet age
+    - Top 3 buyers' average graduation rate
+    - Average concurrent buys per buyer (detects multi-tokening)
+    - Percentage of buyers buying multiple tokens simultaneously
+  </Tab>
+  <Tab title="Market Context (3)">
+    - Tokens created in the last hour
+    - Rolling graduation rate over the last 2 hours
+    - Market regime, encoded numerically (0=bear, 1=transition, 2=bull_normal, 3=euphoria)
+  </Tab>
+</Tabs>
+
+## Genesis Strategies
+
+The genesis models support multiple strategy configurations, each targeting a different return/time outcome. The watcher evaluates each enabled strategy in priority order and emits the highest-priority signal exceeding its threshold.
+
+| Strategy | Target | Score Threshold | Take Profit | Hold Limit |
+|---|---|---|---|---|
+| `genesis_3x_30m` | 3× in 30 minutes | 90% | 3× | 30 min |
+| `genesis_5x_2h` | 5× in 2 hours | 80% | 5× | 2 hr |
+| `genesis_2x_5m` | 2× in 5 minutes | 90% | 2× | 5 min |
+| `genesis_3x_1h` | 3× in 1 hour | 90% | 3× | 60 min |
+
+<Warning>
+  The dead-probability model (`is_dead_5m`) acts as a veto: if the model predicts the token is likely dead within 5 minutes, the genesis signal is suppressed regardless of the target model's score. No strategy threshold overrides this veto.
+</Warning>
+
+## Signal Payload
+
+The genesis signal published to Redis includes the full feature dictionary for logging and post-hoc analysis. The live trader uses `selectedStrategy` to look up the correct take-profit, stop-loss, and hold-time configuration.
+
+```json
+{
+  "type": "genesis_signal",
+  "data": {
+    "tokenMint": "...",
+    "symbol": "TOKEN",
+    "creator": "...",
+    "selectedStrategy": "genesis_3x_30m",
+    "genesisScore": 0.93,
+    "deadProb": 0.04,
+    "aliveProb": 0.88,
+    "predPeak": 4.2,
+    "entryPrice": 0.000001234,
+    "features": { "..." : "..." }
+  }
+}
+```
+
+<Tip>
+  The `predPeak` field represents the model's predicted peak multiple, not a guaranteed return. It is useful for sizing decisions and post-trade analysis but should not be treated as a price target.
+</Tip>

@@ -1,0 +1,129 @@
+---
+title: "Adversarial Detection: Bundles, Bots, and Manipulation"
+description: "How Alpha Leak identifies coordinated bundles, serial ruggers, wash trading, exit liquidity traps, and bot noise before capital is ever deployed."
+---
+
+Pump.fun is adversarial by design. A significant share of activity on the platform is not organic price discovery — it is coordinated manipulation, bot noise, and deliberate traps set for retail participants. Alpha Leak runs a dedicated layer of adversarial detectors that identify these patterns and ensure the trading system never acts on manufactured signals. Each detection method feeds independently into both the ML feature vector and the `AntiSignalEmitter`, which is the final gate before any position is opened.
+
+## Threat Coverage
+
+| Threat | Detection Method | Response |
+|---|---|---|
+| Bundle / coordinated buy | BundleDetector (5s time windows) | Token flagged, `bundle_confidence` ML feature raised |
+| Bot noise | BotDetector (3 behavioral patterns) | Wallet capped at alpha 30, `is_bot` ML feature set |
+| Serial rugger | CreatorRiskScorer (rug rate, lifetime, insiders) | `creator_risk_score` ML feature raised, anti-signal trigger |
+| Copy-trade follower signal | CopyTradeDetector (directional consistency) | Signal downweighted, originator vs follower resolved |
+| Wash trading | Token risk scorer (buy/sell pattern analysis) | `wash_trade_pct` ML feature, anti-signal trigger at >30% |
+| Exit liquidity trap | AntiSignalEmitter (smart wallets selling into retail) | Anti-signal emitted, open position force-exited |
+| Crowded trade | SignalCrowdingDetector (tracked SOL vs curve SOL) | Score penalty up to 50%, Redis cached per token |
+
+## Detection Mechanisms
+
+<Tabs>
+  <Tab title="Bundle Detection">
+    Bundles are the most common form of coordinated manipulation on Pump.fun. A group of wallets — often controlled by the same operator — buys a token within the same few seconds at or near launch. This creates the appearance of organic momentum while actually front-running the curve for a later dump.
+
+    The `BundleDetector` groups trades into 5-second time buckets and identifies clusters of 3+ wallets buying the same token in the same window. Each cluster is then scored on two independent dimensions:
+
+    **Amount uniformity** (coefficient of variation &lt; 0.3): Are the buy sizes suspiciously similar? Random wallets rarely buy the exact same SOL amount within the same window.
+
+    **Rank continuity** (rank span ≤ wallet count): Are the buy ranks consecutive? Consecutive buy ranks in a tight time window indicate the wallets transacted in rapid succession from the same source.
+
+    <CardGroup cols={3}>
+      <Card title="same_slot_coordinated" icon="triangle-exclamation">
+        Both amount uniformity and rank continuity criteria met. The strongest form of bundle evidence.
+      </Card>
+      <Card title="similar_amounts" icon="circle-exclamation">
+        Similar buy sizes but non-consecutive ranks. Coordination is likely but less certain.
+      </Card>
+      <Card title="time_window" icon="circle-info">
+        Only time proximity met. Weakest classification — flags for additional scrutiny.
+      </Card>
+    </CardGroup>
+
+    The confidence score (0.3–1.0) feeds into the ML model as `token_bundle_confidence` and into the `AntiSignalEmitter` as an independent trigger.
+  </Tab>
+
+  <Tab title="Creator Risk Scoring">
+    Not all creators are equal. The `CreatorRiskScorer` builds a longitudinal view of every creator with 2+ tokens on-chain.
+
+    The most useful metric is the **rug rate**: the fraction of a creator's tokens that had their last trade within 10 minutes of launch and never graduated. A creator with a 90% rug rate has a consistent and deliberate pattern of launching tokens that die immediately — typically because the creator or insiders dump before any retail participation.
+
+    Additional signals computed per creator:
+
+    - **Serial velocity** — tokens per day over the last 30 days. High velocity combined with a high rug rate is an extremely reliable indicator of malicious intent.
+    - **Avg insider presence** — average count of insider wallets across the creator's tokens.
+    - **Avg bot buyer pct** — creators whose tokens attract almost exclusively bots are likely farming interaction metrics rather than building organic communities.
+
+    <Warning>
+      The creator risk score (0–100) acts as both a direct ML feature and an anti-signal trigger. A score above 80 is sufficient — combined with one other trigger — to force-exit any open position in that token.
+    </Warning>
+  </Tab>
+
+  <Tab title="Wash Trading">
+    The token risk scorer analyses buy/sell patterns to identify circular or self-referential volume that does not represent genuine market activity. The resulting `wash_trade_pct` quantifies what proportion of a token's observed volume is likely wash traded.
+
+    When `wash_trade_pct` exceeds 30%, the anti-signal system treats it as an active manipulation trigger. A token where nearly a third of all volume is synthetic has no reliable price discovery — any signal built on top of that volume is compromised.
+  </Tab>
+
+  <Tab title="Signal Crowding">
+    The `SignalCrowdingDetector` monitors how much of a token's bonding curve is already held by the tracked wallet universe. When tracked wallets collectively represent a large fraction of a token's SOL, the trade is crowded.
+
+    Crowded trades receive a score penalty of up to 50%, cached in Redis per token. The logic is straightforward: if every smart wallet in the system already holds a token, there is no remaining smart-money buying pressure to follow — and exits will be competitive.
+  </Tab>
+</Tabs>
+
+## Anti-Signal Logic
+
+The `AntiSignalEmitter` is the system's last line of defense before capital is deployed. It scans every token with an active buy signal every 30 seconds, checking six independently computed risk signals. Any two triggers firing simultaneously is sufficient to emit an anti-signal.
+
+```
+Anti-signal fired when ≥ 2 of:
+
+1. Creator risk score > 80
+   "Creator [X] has 85% rug rate across 47 tokens"
+
+2. Insider buyer pct > 40%
+   "62% of buyers are insiders/bundled wallets (8/13)"
+
+3. Exit liquidity pattern
+   "4 smart wallets selling (12.3 SOL) while retail buying (3.1 SOL)"
+
+4. Wash trade pct > 30%
+   "41% of volume appears to be wash trading"
+
+5. Bot buyer pct > 60%
+   "78% of buyers are bots"
+
+6. Bundle confidence > 70% + bundle buyer pct > 30%
+   "Coordinated bundle (82% confidence, 45% of buyers)"
+```
+
+<Note>
+  The multi-trigger design is intentional. Any single metric can be noisy — a 70% bot buyer rate on a brand-new token might simply mean no humans have discovered it yet. When 3 or 4 triggers fire simultaneously, the evidence is overwhelming. Each anti-signal payload includes the full evidence object with the specific numbers, logged and stored for auditing.
+</Note>
+
+Anti-signals published to `trade:signals` are consumed by the live trader, which immediately force-exits any open position in the flagged token.
+
+## Exit Liquidity Detection
+
+The exit liquidity trigger is one of the most reliable indicators of a dump in progress, and it deserves particular attention because it exploits the system's own signal history against it.
+
+<Steps>
+  <Step title="Smart money established a position">
+    A token has had smart-wallet buy signals in the last 15 minutes, creating the appearance of a high-conviction trade.
+  </Step>
+  <Step title="Smart money begins selling">
+    Those same smart wallets are now selling — their exits are detected in the last 10-minute window.
+  </Step>
+  <Step title="Retail fills the gap">
+    Simultaneously, retail wallets (not in the tracked set) are buying, absorbing the smart-money exits.
+  </Step>
+  <Step title="Anti-signal fires">
+    The detector computes tracked sell SOL vs retail buy SOL ratio as evidence, then fires the anti-signal and force-exits any open position immediately.
+  </Step>
+</Steps>
+
+<Warning>
+  This is the classic exit liquidity setup: smart money established a position, created momentum or a signal, and is now using retail buying to get out. The anti-signal fires and exits any position immediately — no waiting for stop-loss levels.
+</Warning>

@@ -1,0 +1,100 @@
+---
+title: "Live Trader: Execution, scoring, and position monitoring"
+description: "How the live trader subscribes to signals, runs inline ML scoring, selects strategies, executes on-chain atomically, and monitors open positions."
+---
+
+The live trader is a standalone process that sits beside the main pipeline without depending on it for scoring latency. It subscribes to the signal channel, runs ONNX inference inline in-process, and executes buys and sells directly against the Pump.fun bonding curve. Because it is decoupled from the main pipeline, it can be restarted, upgraded, or paused without affecting data collection or intelligence processing.
+
+## How it works
+
+The trader receives three event types from the signal channel and routes each through a dedicated path before reaching the exit monitor:
+
+```text
+Signal channel (real time)
+         │
+         ├── type: signal         → InlineScorer → strategy selection → buy
+         ├── type: genesis_signal → InlineScorer → strategy selection → buy
+         └── type: anti_signal    → force-exit any open position in that token
+                  │
+                  ▼
+         PortfolioManager
+         (phase check, concurrent position limit, circuit breakers, sizing)
+                  │
+                  ▼
+         TradeExecutor
+         (Bonding curve execution, atomic bundles)
+                  │
+                  ▼
+         ExitMonitor (3s poll)
+         (take-profit, stop-loss, timeout, anti-signal force exit)
+```
+
+## Inline scoring
+
+Rather than waiting for the main pipeline's `MlInference` service to score a signal and write it back to the database, the live trader runs ONNX inference inline — loading the same models and assembling the same feature vector independently. This eliminates the 5-second lag between signal emission and ML score availability.
+
+The signal payload includes all fields needed to build the feature vector, so no database round-trip is required. A decision can be made within milliseconds of the signal arriving.
+
+## Strategy selection
+
+When a signal arrives, the trader evaluates all strategies eligible given the current phase and balance. All six criteria must be satisfied before a strategy is considered:
+
+<Steps>
+  <Step title="ML probability threshold">
+    The model's calibrated probability must meet or exceed the strategy's `score_threshold`.
+  </Step>
+  <Step title="Dead probability veto">
+    The `dead_prob` must be below the strategy's `dead_threshold` (where one is configured).
+  </Step>
+  <Step title="Phase check">
+    The current phase must be greater than or equal to the strategy's `min_phase`.
+  </Step>
+  <Step title="Concurrent position slot">
+    A concurrent position slot must be available under the phase's maximum.
+  </Step>
+  <Step title="No existing position">
+    No position must already be open in the same token.
+  </Step>
+  <Step title="Per-token cooldown clear">
+    The token must not be within the 30-minute cooldown window following a previous close.
+  </Step>
+</Steps>
+
+If multiple strategies qualify, the highest-priority one is selected. Priority is defined in the strategy configuration, not inferred at runtime.
+
+## Execution
+
+The `TradeExecutor` handles all on-chain execution. For each trade it:
+
+1. Derives the bonding curve account from the token mint
+2. Calculates the exact expected token output from the bonding curve math, so slippage is known before the transaction is submitted
+3. Constructs and submits the transaction as an atomic bundle
+
+Atomic execution means the transaction either lands exactly as constructed or not at all — there is no partial fill or unexpected slippage. Execution is prioritised for fast landing during high-congestion periods.
+
+## Exit monitoring
+
+An exit monitor polls every 3 seconds for each open position, checking against real-time price data maintained in the cache layer by the pipeline's CurveManager. Four exit conditions are evaluated in order:
+
+| Condition | Trigger | Log reason |
+|---|---|---|
+| Take profit | Current price ≥ entry × `take_profit_multiple` | `take_profit` |
+| Trailing stop | Price dropped >15% from peak multiple | `trailing_stop` |
+| Stop loss | Current price ≤ entry × `stop_loss_multiple` | `stop_loss` |
+| Timeout | Hold time exceeded strategy's `max_hold_minutes` | `timeout` |
+
+Additionally, if an `anti_signal` arrives for a token with an open position, the position is force-exited immediately regardless of current price, profit, or hold time. The anti-signal response takes priority over all other exit logic.
+
+## Simulation mode
+
+The live trader can be run in simulation mode where every decision — score evaluation, strategy selection, position sizing, exit logic — executes exactly as in live mode, but no transactions are submitted on-chain. All decisions are logged in full detail. This is the recommended way to validate a new model or strategy configuration before deploying capital.
+
+<Tip>
+  Run simulation mode against a day of replayed signal history before promoting a new strategy to live trading. The logs include the full scoring breakdown and sizing calculation for every evaluated signal.
+</Tip>
+
+## Persistence
+
+Every trade is fully persisted to the database. On restart, the trader loads all open positions from the database and resumes monitoring them. No positions are lost across restarts.
+
+The `live_portfolio` table tracks the overall portfolio: current balance, total P&L, win count, loss count, and streak data. This is the single source of truth for performance reporting.
